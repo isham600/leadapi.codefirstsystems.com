@@ -1,0 +1,13 @@
+{
+  "name": "ai-call-agi",
+  "version": "1.0.0",
+  "description": "FastAGI server for AI phone conversations on FreePBX",
+  "main": "ai-call-agi.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "google-auth-library": "^9.0.0"
+  }
+}

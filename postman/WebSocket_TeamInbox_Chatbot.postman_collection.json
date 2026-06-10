@@ -1,0 +1,486 @@
+{
+  "info": {
+    "_postman_id": "ws-teaminbox-chatbot-v1",
+    "name": "ApiLead — WebSocket + Team Inbox + Chatbot",
+    "description": "# WebSocket Real-time + Team Inbox + Chatbot Flows\n\n## WebSocket\nConnect: `ws://{{base_url}}/api/ws?token={{auth_token}}`\n\n**Event types received:**\n- `connected` — auth success\n- `new_message` — inbound or outbound message\n- `conversation_update` — sidebar update\n- `pong` — reply to ping\n\n**Send ping (keep-alive):**\n```json\n{\"type\":\"ping\"}\n```\n\n## Auth\nSet `auth_token` variable from login response.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url",    "value": "https://apilead.nuke.co.in", "type": "string" },
+    { "key": "auth_token",  "value": "", "type": "string" },
+    { "key": "flow_id",     "value": "1", "type": "string" },
+    { "key": "step_id",     "value": "1", "type": "string" },
+    { "key": "conv_id",     "value": "", "type": "string" }
+  ],
+  "item": [
+
+    {
+      "name": "🔌 WebSocket",
+      "item": [
+        {
+          "name": "WS — Connect (Live Inbox)",
+          "description": "## How to test WebSocket in Postman\n\n1. Open Postman → click **New** → select **WebSocket**\n2. Enter URL: `ws://{{base_url}}/api/ws?token={{auth_token}}`\n3. Click **Connect**\n4. You will receive: `{\"type\":\"connected\",\"uuid\":\"...\",\"username\":\"...\"}`\n5. Every inbound WhatsApp / Facebook / chatbot message will push a `new_message` event\n6. Every sidebar update will push a `conversation_update` event\n\n## Keep-alive ping\nIn the message box send:\n```json\n{\"type\":\"ping\"}\n```\nResponse: `{\"type\":\"pong\",\"ts\":1234567890}`\n\n## Event Shapes\n\n### new_message\n```json\n{\n  \"type\": \"new_message\",\n  \"id\": 123,\n  \"conversation_id\": \"abc123\",\n  \"channel\": \"whatsapp\",\n  \"sender_id\": \"919999999999\",\n  \"receiver_id\": \"918888888888\",\n  \"contact_name\": \"John Doe\",\n  \"msg_type\": \"text\",\n  \"text\": \"Hello!\",\n  \"direction\": \"inbound\",\n  \"status\": \"received\",\n  \"created_at\": \"2024-01-01T10:00:00.000Z\"\n}\n```\n\n### conversation_update\n```json\n{\n  \"type\": \"conversation_update\",\n  \"conversation_id\": \"abc123\",\n  \"channel\": \"whatsapp\",\n  \"sender_id\": \"919999999999\",\n  \"receiver_id\": \"918888888888\",\n  \"last_message\": \"Hello!\",\n  \"last_message_type\": \"text\",\n  \"last_message_dir\": \"inbound\",\n  \"updated_at\": \"2024-01-01T10:00:00.000Z\"\n}\n```",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "ws://{{base_url}}/api/ws?token={{auth_token}}",
+              "protocol": "ws",
+              "host": ["{{base_url}}"],
+              "path": ["api", "ws"],
+              "query": [
+                { "key": "token", "value": "{{auth_token}}", "description": "JWT from login" }
+              ]
+            },
+            "description": "WebSocket connection. In Postman: New → WebSocket → paste URL."
+          },
+          "response": []
+        }
+      ]
+    },
+
+    {
+      "name": "📥 Team Inbox",
+      "item": [
+        {
+          "name": "List Team Inbox (Agent view)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/team-inbox?page=1&limit=30",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "team-inbox"],
+              "query": [
+                { "key": "page",    "value": "1" },
+                { "key": "limit",   "value": "30" },
+                { "key": "channel", "value": "", "description": "whatsapp | facebook | google | rcs | chatbot | webhook", "disabled": true },
+                { "key": "status",  "value": "", "description": "open | assigned | resolved", "disabled": true },
+                { "key": "unread",  "value": "1", "description": "1 = only unread", "disabled": true },
+                { "key": "search",  "value": "", "description": "Search by contact name, phone, message", "disabled": true }
+              ]
+            },
+            "description": "**Agents** automatically see only conversations assigned to them.\n**Admins/owners** see all conversations."
+          },
+          "response": [
+            {
+              "name": "200 OK — Agent view",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"status\": 1,\n  \"statuscode\": 200,\n  \"message\": \"Team inbox fetched\",\n  \"meta\": {\n    \"viewing_as\": \"agent\",\n    \"agent_filter\": \"agent_username\",\n    \"account\": \"owner_username\"\n  },\n  \"data\": [\n    {\n      \"id\": 1,\n      \"conversation_id\": \"abc123\",\n      \"channel\": \"whatsapp\",\n      \"sender_id\": \"919999999999\",\n      \"receiver_id\": \"918888888888\",\n      \"contact_name\": \"John Doe\",\n      \"last_message\": \"Hello!\",\n      \"last_message_type\": \"text\",\n      \"last_message_at\": \"2024-01-01 15:30:00+05:30\",\n      \"last_message_dir\": \"inbound\",\n      \"session_message_time\": \"2024-01-01 15:30:00+05:30\",\n      \"is_read\": 0,\n      \"unread_count\": 3,\n      \"is_starred\": 0,\n      \"conv_status\": \"assigned\",\n      \"assigned_to\": \"agent_username\",\n      \"tags\": null,\n      \"notes\": null,\n      \"created_at\": \"2024-01-01 10:00:00+05:30\",\n      \"updated_at\": \"2024-01-01 15:30:00+05:30\"\n    }\n  ],\n  \"pagination\": {\n    \"page\": 1,\n    \"limit\": 30,\n    \"total\": 1,\n    \"total_pages\": 1,\n    \"has_next\": false,\n    \"has_prev\": false\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "List Team Inbox (Admin — filter by agent)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/team-inbox?agent=agent_username",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "team-inbox"],
+              "query": [
+                { "key": "agent",  "value": "agent_username", "description": "Admin only: filter by agent" },
+                { "key": "page",   "value": "1" },
+                { "key": "limit",  "value": "30" },
+                { "key": "status", "value": "open", "disabled": true }
+              ]
+            },
+            "description": "Admin sees conversations assigned to a specific agent."
+          },
+          "response": []
+        },
+        {
+          "name": "Inbox — Filter by assigned_to",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/inbox?assigned_to=agent_username",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "inbox"],
+              "query": [
+                { "key": "assigned_to", "value": "agent_username" }
+              ]
+            },
+            "description": "Standard inbox with optional `assigned_to` filter."
+          },
+          "response": []
+        }
+      ]
+    },
+
+    {
+      "name": "🤖 Chatbot Flows",
+      "item": [
+
+        {
+          "name": "List All Flows",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/flows",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "flows"]
+            },
+            "description": "Returns all flows with their steps."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"status\": 1,\n  \"data\": [\n    {\n      \"id\": 1,\n      \"uuid\": \"user-uuid\",\n      \"username\": \"owner\",\n      \"flow_name\": \"Lead Capture\",\n      \"trigger_keywords\": \"hi,hello,start\",\n      \"is_default\": 0,\n      \"is_active\": 1,\n      \"created_at\": \"2024-01-01T00:00:00.000Z\",\n      \"updated_at\": \"2024-01-01T00:00:00.000Z\",\n      \"steps\": [\n        {\n          \"id\": 1,\n          \"flow_id\": 1,\n          \"step_order\": 0,\n          \"step_type\": \"message\",\n          \"message\": \"Welcome! I'm here to help.\",\n          \"variable_name\": null\n        },\n        {\n          \"id\": 2,\n          \"flow_id\": 1,\n          \"step_order\": 1,\n          \"step_type\": \"question\",\n          \"message\": \"What's your name?\",\n          \"variable_name\": \"name\"\n        },\n        {\n          \"id\": 3,\n          \"flow_id\": 1,\n          \"step_order\": 2,\n          \"step_type\": \"question\",\n          \"message\": \"What's your email?\",\n          \"variable_name\": \"email\"\n        },\n        {\n          \"id\": 4,\n          \"flow_id\": 1,\n          \"step_order\": 3,\n          \"step_type\": \"end\",\n          \"message\": \"Thanks! Our team will reach out shortly.\",\n          \"variable_name\": null\n        }\n      ]\n    }\n  ]\n}"
+            }
+          ]
+        },
+
+        {
+          "name": "Create Flow (with steps)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/flows",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "flows"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"flow_name\": \"Lead Capture\",\n  \"trigger_keywords\": \"hi,hello,start,hey\",\n  \"is_default\": false,\n  \"is_active\": true,\n  \"steps\": [\n    {\n      \"step_order\": 0,\n      \"step_type\": \"message\",\n      \"message\": \"Welcome! I'm here to help you with your inquiry.\"\n    },\n    {\n      \"step_order\": 1,\n      \"step_type\": \"question\",\n      \"message\": \"What's your full name?\",\n      \"variable_name\": \"name\"\n    },\n    {\n      \"step_order\": 2,\n      \"step_type\": \"question\",\n      \"message\": \"What's your email address?\",\n      \"variable_name\": \"email\"\n    },\n    {\n      \"step_order\": 3,\n      \"step_type\": \"question\",\n      \"message\": \"What product/service are you interested in?\",\n      \"variable_name\": \"interest\"\n    },\n    {\n      \"step_order\": 4,\n      \"step_type\": \"end\",\n      \"message\": \"Thank you! Our team will contact you within 24 hours. 🎉\"\n    }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "## step_type values\n- `message` — send text and immediately continue to next step\n- `question` — send text, wait for user reply, store in `variable_name`\n- `end` — send optional closing message and end the session\n\n## trigger_keywords\nComma-separated. Use `*` to match all messages. Leave empty for default flow.\n\n## is_default\nSet `true` for one flow to use as fallback when no keyword matches."
+          },
+          "response": [
+            {
+              "name": "201 Created",
+              "status": "Created",
+              "code": 201,
+              "body": "{\n  \"status\": 1,\n  \"message\": \"Flow created\",\n  \"data\": { \"id\": 1 }\n}"
+            }
+          ]
+        },
+
+        {
+          "name": "Create Default Flow (fallback)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/flows",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "flows"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"flow_name\": \"Default / Fallback\",\n  \"trigger_keywords\": null,\n  \"is_default\": true,\n  \"is_active\": true,\n  \"steps\": [\n    {\n      \"step_order\": 0,\n      \"step_type\": \"message\",\n      \"message\": \"Hi there! 👋 I didn't quite understand that.\"\n    },\n    {\n      \"step_order\": 1,\n      \"step_type\": \"end\",\n      \"message\": \"Type 'hi' to get started or reply with your question.\"\n    }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "This flow triggers when no keyword matches any other flow."
+          },
+          "response": []
+        },
+
+        {
+          "name": "Update Flow",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flow_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "flows", "{{flow_id}}"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"flow_name\": \"Lead Capture v2\",\n  \"trigger_keywords\": \"hi,hello,start,hey,help\",\n  \"is_active\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{ \"status\": 1, \"message\": \"Flow updated\" }"
+            }
+          ]
+        },
+
+        {
+          "name": "Delete Flow",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flow_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "flows", "{{flow_id}}"]
+            },
+            "description": "Deletes the flow and all its steps."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{ \"status\": 1, \"message\": \"Flow deleted\" }"
+            }
+          ]
+        }
+      ]
+    },
+
+    {
+      "name": "📋 Chatbot Steps",
+      "item": [
+        {
+          "name": "List Steps",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flow_id}}/steps",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "flows", "{{flow_id}}", "steps"]
+            }
+          },
+          "response": []
+        },
+
+        {
+          "name": "Add Step",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flow_id}}/steps",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "flows", "{{flow_id}}", "steps"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"step_order\": 5,\n  \"step_type\": \"question\",\n  \"message\": \"What is your phone number?\",\n  \"variable_name\": \"phone\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Omit `step_order` to auto-append at the end."
+          },
+          "response": [
+            {
+              "name": "201 Created",
+              "status": "Created",
+              "code": 201,
+              "body": "{ \"status\": 1, \"message\": \"Step added\", \"data\": { \"id\": 5 } }"
+            }
+          ]
+        },
+
+        {
+          "name": "Update Step",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flow_id}}/steps/{{step_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "flows", "{{flow_id}}", "steps", "{{step_id}}"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"What is your full name? (First & Last)\",\n  \"step_type\": \"question\",\n  \"variable_name\": \"name\"\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{ \"status\": 1, \"message\": \"Step updated\" }"
+            }
+          ]
+        },
+
+        {
+          "name": "Delete Step",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flow_id}}/steps/{{step_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "flows", "{{flow_id}}", "steps", "{{step_id}}"]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{ \"status\": 1, \"message\": \"Step deleted\" }"
+            }
+          ]
+        }
+      ]
+    },
+
+    {
+      "name": "📊 Chatbot Sessions",
+      "item": [
+        {
+          "name": "List Sessions (all)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/sessions?page=1&limit=20",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "sessions"],
+              "query": [
+                { "key": "page",   "value": "1" },
+                { "key": "limit",  "value": "20" },
+                { "key": "status", "value": "active",    "description": "active | completed", "disabled": true }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"status\": 1,\n  \"data\": [\n    {\n      \"id\": 1,\n      \"uuid\": \"user-uuid\",\n      \"sender_id\": \"919999999999\",\n      \"conversation_id\": \"abc123\",\n      \"flow_id\": 1,\n      \"flow_name\": \"Lead Capture\",\n      \"collected_data\": {\n        \"name\": \"John Doe\",\n        \"email\": \"john@example.com\",\n        \"interest\": \"CRM Software\"\n      },\n      \"status\": \"completed\",\n      \"created_at\": \"2024-01-01T10:00:00.000Z\",\n      \"updated_at\": \"2024-01-01T10:05:00.000Z\"\n    }\n  ],\n  \"pagination\": {\n    \"page\": 1,\n    \"limit\": 20,\n    \"total\": 1,\n    \"pages\": 1\n  }\n}"
+            }
+          ]
+        },
+
+        {
+          "name": "List Sessions (active only)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/sessions?status=active",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "sessions"],
+              "query": [
+                { "key": "status", "value": "active" }
+              ]
+            }
+          },
+          "response": []
+        },
+
+        {
+          "name": "List Sessions (completed)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{auth_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/sessions?status=completed",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "sessions"],
+              "query": [
+                { "key": "status", "value": "completed" }
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+
+    {
+      "name": "💡 WS Test Scenarios",
+      "item": [
+        {
+          "name": "Simulate — POST inbound chatbot message",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/{{uuid}}/chatbot",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "{{uuid}}", "chatbot"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": {\n    \"id\": \"msg_{{$randomUUID}}\",\n    \"from\": \"919876543210\",\n    \"type\": \"text\",\n    \"text\": { \"body\": \"hi\" }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Triggers the chatbot flow. Watch WS client for `new_message` + `conversation_update` events.\n\nThe chatbot engine will:\n1. Match keyword `hi` → find a flow\n2. Send flow messages back via WhatsApp API\n3. Push WS events to connected clients"
+          },
+          "response": [
+            {
+              "name": "200 OK — instant ack",
+              "status": "OK",
+              "code": 200,
+              "body": "{ \"status\": 1, \"message\": \"OK\" }"
+            }
+          ]
+        },
+        {
+          "name": "Simulate — POST inbound whatsapp message",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/{{uuid}}/whatsapp",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "{{uuid}}", "whatsapp"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"object\": \"whatsapp_business_account\",\n  \"entry\": [\n    {\n      \"id\": \"WABA_ID\",\n      \"changes\": [\n        {\n          \"value\": {\n            \"messaging_product\": \"whatsapp\",\n            \"metadata\": {\n              \"display_phone_number\": \"918888888888\",\n              \"phone_number_id\": \"PHONE_NUMBER_ID\"\n            },\n            \"messages\": [\n              {\n                \"from\": \"919876543210\",\n                \"id\": \"wamid.test123\",\n                \"timestamp\": \"1700000000\",\n                \"type\": \"text\",\n                \"text\": { \"body\": \"Hello from WhatsApp!\" }\n              }\n            ]\n          },\n          \"field\": \"messages\"\n        }\n      ]\n    }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Simulates an inbound WhatsApp message. Watch WS for real-time event."
+          },
+          "response": []
+        }
+      ]
+    }
+
+  ]
+}

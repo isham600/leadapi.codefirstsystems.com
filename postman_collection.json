@@ -1,0 +1,644 @@
+{
+  "info": {
+    "name": "Indew Lead App API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url",        "value": "https://apilead.nuke.co.in" },
+    { "key": "token",           "value": "YOUR_JWT_TOKEN" },
+    { "key": "uuid",            "value": "YOUR_UUID" },
+    { "key": "conversationId",  "value": "CONVERSATION_ID" },
+    { "key": "flowId",          "value": "FLOW_ID" },
+    { "key": "stepId",          "value": "STEP_ID" },
+    { "key": "rcsAccountId",    "value": "RCS_ACCOUNT_ID" }
+  ],
+  "item": [
+
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/api/users/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"your_username\",\n  \"password\": \"your_password\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/api/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"newuser\",\n  \"password\": \"password\",\n  \"email\": \"user@example.com\"\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Inbox",
+      "item": [
+        {
+          "name": "List Conversations",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/inbox?page=1&limit=30&channel=all&status=all",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "inbox"],
+              "query": [
+                { "key": "page",    "value": "1" },
+                { "key": "limit",   "value": "30" },
+                { "key": "channel", "value": "all",  "description": "whatsapp | rcs | facebook | instagram | all" },
+                { "key": "status",  "value": "all",  "description": "open | assigned | resolved | all" },
+                { "key": "unread",  "value": "0",    "description": "1 = unread only" },
+                { "key": "starred", "value": "0",    "description": "1 = starred only" },
+                { "key": "search",  "value": "",     "description": "search by name / phone / message" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Team Inbox",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/team-inbox?page=1&limit=30",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "team-inbox"],
+              "query": [
+                { "key": "page",    "value": "1" },
+                { "key": "limit",   "value": "30" },
+                { "key": "channel", "value": "all" },
+                { "key": "status",  "value": "all" },
+                { "key": "unread",  "value": "0" },
+                { "key": "agent",   "value": "",    "description": "filter by agent username (admin only)" },
+                { "key": "search",  "value": "" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Conversation Messages",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/messages?page=1&limit=50",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "inbox", "{{conversationId}}", "messages"],
+              "query": [
+                { "key": "page",  "value": "1" },
+                { "key": "limit", "value": "50" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Mark as Read",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/read"
+          }
+        },
+        {
+          "name": "Star / Unstar",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/star",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"is_starred\": true\n}"
+            }
+          }
+        },
+        {
+          "name": "Assign Conversation",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/assign",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"assigned_to\": \"agent_username\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Resolve Conversation",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/resolve"
+          }
+        },
+        {
+          "name": "Update Notes",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/notes",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"notes\": \"Customer interested in plan A\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Export Chat",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/export?format=json",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "inbox", "{{conversationId}}", "export"],
+              "query": [{ "key": "format", "value": "json", "description": "json | csv" }]
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Send Messages",
+      "item": [
+        {
+          "name": "Send WhatsApp Text",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/send",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"text\",\n  \"text\": \"Hello! How can I help you?\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Send WhatsApp Image (URL)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/send",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"image\",\n  \"media_url\": \"https://example.com/image.jpg\",\n  \"caption\": \"Check this out!\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Send WhatsApp Template",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/send",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"template\",\n  \"template_name\": \"hello_world\",\n  \"template_lang\": \"en_US\",\n  \"template_components\": []\n}"
+            }
+          }
+        },
+        {
+          "name": "Send WhatsApp Document (URL)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/send",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"document\",\n  \"media_url\": \"https://example.com/file.pdf\",\n  \"media_filename\": \"brochure.pdf\",\n  \"caption\": \"Please find the attached document\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Send WhatsApp File (Upload)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/send-file",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "file",    "type": "file",  "src": "" },
+                { "key": "caption", "type": "text",  "value": "Here is your file" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Send RCS Text",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/send-rcs",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"text\",\n  \"text\": \"Hello via RCS!\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Send RCS Image (URL)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/send-rcs",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"image\",\n  \"media_url\": \"https://example.com/image.jpg\",\n  \"caption\": \"Check this!\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Send RCS Document (URL)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/inbox/{{conversationId}}/send-rcs",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"document\",\n  \"media_url\": \"https://example.com/file.pdf\",\n  \"caption\": \"Your document\"\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "RCS Accounts",
+      "item": [
+        {
+          "name": "List RCS Accounts",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/rcs/accounts"
+          }
+        },
+        {
+          "name": "Create RCS Account",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/rcs/accounts",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"agent_id\": \"your_agent@rbm.goog\",\n  \"bot_id\": \"YOUR_BOT_ID\",\n  \"bot_name\": \"Your Bot Name\",\n  \"api_key\": \"YOUR_GOOGLE_RBM_API_KEY\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Update RCS Account",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/rcs/accounts/{{rcsAccountId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"api_key\": \"NEW_API_KEY\",\n  \"status\": \"active\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete RCS Account",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/rcs/accounts/{{rcsAccountId}}"
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Webhook Settings",
+      "item": [
+        {
+          "name": "Get Settings",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/settings"
+          }
+        },
+        {
+          "name": "Update Settings",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/settings",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"webhook_secret_enabled\": true,\n  \"webhook_secret\": \"my_secret_key\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Webhook Logs",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/logs?page=1&limit=30&channel=all",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "logs"],
+              "query": [
+                { "key": "page",    "value": "1" },
+                { "key": "limit",   "value": "30" },
+                { "key": "channel", "value": "all" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Forward URLs",
+      "item": [
+        {
+          "name": "List Forward URLs",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/forward-urls"
+          }
+        },
+        {
+          "name": "Add Forward URL",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/forward-urls",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://your-server.com/webhook\",\n  \"channel\": \"all\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Update Forward URL",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/forward-urls/1",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://new-url.com/webhook\",\n  \"status\": \"active\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete Forward URL",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/forward-urls/1"
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Chatbot Flows",
+      "item": [
+        {
+          "name": "List Flows",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/chatbot/flows"
+          }
+        },
+        {
+          "name": "Create Flow",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/chatbot/flows",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Welcome Flow\",\n  \"channel\": \"whatsapp\",\n  \"trigger_keyword\": \"hi\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Update Flow",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flowId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Updated Flow\",\n  \"status\": \"active\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete Flow",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flowId}}"
+          }
+        },
+        {
+          "name": "List Flow Steps",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flowId}}/steps"
+          }
+        },
+        {
+          "name": "Add Flow Step",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flowId}}/steps",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"step_order\": 1,\n  \"type\": \"text\",\n  \"message\": \"Hello! How can I help you?\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Update Flow Step",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type",  "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flowId}}/steps/{{stepId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"Updated message\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete Flow Step",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/webhook/auth/chatbot/flows/{{flowId}}/steps/{{stepId}}"
+          }
+        },
+        {
+          "name": "List Chatbot Sessions",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": {
+              "raw": "{{base_url}}/api/webhook/auth/chatbot/sessions?page=1&limit=30&status=active",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "auth", "chatbot", "sessions"],
+              "query": [
+                { "key": "page",   "value": "1" },
+                { "key": "limit",  "value": "30" },
+                { "key": "status", "value": "active" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Webhook (Public)",
+      "item": [
+        {
+          "name": "Verify Webhook (GET)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/webhook/{{uuid}}/whatsapp?hub.mode=subscribe&hub.verify_token=YOUR_TOKEN&hub.challenge=CHALLENGE",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhook", "{{uuid}}", "whatsapp"],
+              "query": [
+                { "key": "hub.mode",         "value": "subscribe" },
+                { "key": "hub.verify_token", "value": "YOUR_TOKEN" },
+                { "key": "hub.challenge",    "value": "CHALLENGE" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Receive WhatsApp Webhook (POST)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/api/webhook/{{uuid}}/whatsapp",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"object\": \"whatsapp_business_account\",\n  \"entry\": []\n}"
+            }
+          }
+        },
+        {
+          "name": "Receive RCS Webhook (POST)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/api/webhook/{{uuid}}/rcs",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"senderPhoneNumber\": \"+919111991707\",\n  \"messageId\": \"MxApx8s2hcTSyNezlAW34rWw\",\n  \"sendTime\": \"2026-03-13T18:58:40.250317Z\",\n  \"text\": \"Hello\",\n  \"agentId\": \"your_agent@rbm.goog\",\n  \"botId\": \"YOUR_BOT_ID\",\n  \"communicationType\": \"promotional\",\n  \"botName\": \"Your Bot\",\n  \"userId\": \"CU_demo1\",\n  \"epochTimestamp\": 1773428320250\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Meta OAuth",
+      "item": [
+        {
+          "name": "OAuth Callback",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/meta/oauth/callback?code=AUTH_CODE&state=STATE",
+              "host": ["{{base_url}}"],
+              "path": ["api", "meta", "oauth", "callback"],
+              "query": [
+                { "key": "code",  "value": "AUTH_CODE" },
+                { "key": "state", "value": "STATE" }
+              ]
+            }
+          }
+        }
+      ]
+    }
+
+  ]
+}
