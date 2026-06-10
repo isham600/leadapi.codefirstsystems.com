@@ -288,7 +288,7 @@ export const agentdashboard = async (
       .selectFrom("lead_followups")
       .select(["id", "lead_id", "lead_name", "scheduled_at", "notes", "status"])
       .where("login_username", "in", agentUsernames)
-      .where(sql`DATE(scheduled_at) = CURDATE()`)
+      .where(sql`DATE(scheduled_at) = CURDATE()` as any)
       .orderBy("scheduled_at", "asc")
       .limit(10)
       .execute();
@@ -312,7 +312,7 @@ export const agentdashboard = async (
         db.fn.count("id").as("count"),
       ])
       .where("login_username", "in", agentUsernames)
-      .where(sql`DATE(created_at) = CURDATE()`)
+      .where(sql`DATE(created_at) = CURDATE()` as any)
       .groupBy(sql`UPPER(COALESCE(activity_type, 'OTHER'))`)
       .execute();
 
@@ -363,7 +363,7 @@ export const agentdashboard = async (
       .where("login_username", "in", agentUsernames)
       .where("status", "=", "pending")
       .where("scheduled_at", "<", new Date())
-      .where(sql`DATE(scheduled_at) != CURDATE()`)
+      .where(sql`DATE(scheduled_at) != CURDATE()` as any)
       .executeTakeFirst();
     const overdue_tasks = Number(overdueTasksResult?.count || 0);
 
@@ -545,8 +545,8 @@ export const getadmindashboard = async (
       .select(db.fn.count("id").as("count"))
       .where("is_duplicate", "=", 0)
       .where("username", "=", username)
-      .where(sql`DATE(next_followup_at) = CURDATE()`)
-      .where(sql`UPPER(COALESCE(status, '')) NOT IN ('CONVERTED', 'LOST', 'WON / CONVERTED')`)
+      .where(sql`DATE(next_followup_at) = CURDATE()` as any)
+      .where(sql`UPPER(COALESCE(status, '')) NOT IN ('CONVERTED', 'LOST', 'WON / CONVERTED')` as any)
       .executeTakeFirst();
     const dueTodayCount = Number(dueTodayResult?.count || 0);
 
@@ -560,8 +560,8 @@ export const getadmindashboard = async (
       .where("username", "=", username)
       .where("next_followup_at", "is not", null)
       .where("next_followup_at", "<", new Date())
-      .where(sql`DATE(next_followup_at) != CURDATE()`)
-      .where(sql`UPPER(COALESCE(status, '')) NOT IN ('CONVERTED', 'LOST', 'WON / CONVERTED')`)
+      .where(sql`DATE(next_followup_at) != CURDATE()` as any)
+      .where(sql`UPPER(COALESCE(status, '')) NOT IN ('CONVERTED', 'LOST', 'WON / CONVERTED')` as any)
       .executeTakeFirst();
     const overdueCount = Number(overdueResult?.count || 0);
 
@@ -575,7 +575,7 @@ export const getadmindashboard = async (
       .where("username", "=", username)
       .where("created_at", ">=", startDate)
       .where("created_at", "<=", endDate)
-      .where(sql`UPPER(COALESCE(status, '')) IN ('CONVERTED', 'WON / CONVERTED')`)
+      .where(sql`UPPER(COALESCE(status, '')) IN ('CONVERTED', 'WON / CONVERTED')` as any)
       .executeTakeFirst();
     const monthlyRevenue = Number(monthlyRevenueResult?.total || 0);
 
@@ -587,7 +587,7 @@ export const getadmindashboard = async (
       .where("username", "=", username)
       .where("lead_value", "is not", null)
       .where("lead_value", ">", 0)
-      .where(sql`UPPER(COALESCE(status, '')) NOT IN ('CONVERTED', 'WON / CONVERTED', 'LOST')`)
+      .where(sql`UPPER(COALESCE(status, '')) NOT IN ('CONVERTED', 'WON / CONVERTED', 'LOST')` as any)
       .executeTakeFirst();
     const pipelineValue = Number(pipelineValueResult?.total || 0);
 
@@ -598,7 +598,7 @@ export const getadmindashboard = async (
       .where("username", "=", username)
       .where("created_at", ">=", startDate)
       .where("created_at", "<=", endDate)
-      .where(sql`UPPER(COALESCE(status, '')) IN ('CONVERTED', 'WON / CONVERTED')`)
+      .where(sql`UPPER(COALESCE(status, '')) IN ('CONVERTED', 'WON / CONVERTED')` as any)
       .where("lead_value", "is not", null)
       .executeTakeFirst();
     const avgDealSize = Number(avgDealSizeResult?.avg || 0);
@@ -635,7 +635,7 @@ export const getadmindashboard = async (
       .selectFrom("chatbot_summary")
       .select(db.fn.count("id").as("count"))
       .where("username", "=", username)
-      .where(sql`LOWER(COALESCE(status, '')) = 'active'`)
+      .where(sql`LOWER(COALESCE(status, '')) = 'active'` as any)
       .executeTakeFirst();
     const activeWorkflows = Number(activeWorkflowsResult?.count || 0);
 
@@ -643,7 +643,7 @@ export const getadmindashboard = async (
       .selectFrom("chatbot_summary")
       .select(db.fn.sum("runs").as("total"))
       .where("username", "=", username)
-      .where(sql`DATE(last_run) = CURDATE()`)
+      .where(sql`DATE(last_run) = CURDATE()` as any)
       .executeTakeFirst();
     const triggersToday = Number(totalRunsTodayResult?.total || 0);
 
@@ -658,7 +658,7 @@ export const getadmindashboard = async (
       .selectFrom("chatbot_summary")
       .select(db.fn.count("id").as("count"))
       .where("username", "=", username)
-      .where(sql`LOWER(COALESCE(status, '')) = 'draft'`)
+      .where(sql`LOWER(COALESCE(status, '')) = 'draft'` as any)
       .executeTakeFirst();
     const draftWorkflows = Number(draftWorkflowsResult?.count || 0);
 
@@ -835,7 +835,7 @@ export const getLeadsDashboard = async (
         "created_at",
         "updated_at",
       ])
-      .where(sql`UPPER(COALESCE(status, '')) IN ('PROPOSAL SENT', 'NEGOTIATION', 'QUALIFIED', 'FOLLOW UP', 'FOLLOW-UP', 'CONTACTED')`)
+      .where(sql`UPPER(COALESCE(status, '')) IN ('PROPOSAL SENT', 'NEGOTIATION', 'QUALIFIED', 'FOLLOW UP', 'FOLLOW-UP', 'CONTACTED')` as any)
       .orderBy("lead_value", "desc")
       .orderBy("updated_at", "desc")
       .limit(6)

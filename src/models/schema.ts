@@ -418,6 +418,9 @@ export interface Lead {
   is_archived: number;
   created_by?: string | null;
   updated_by?: string | null;
+  meta_form_id?: string | null;
+  meta_lead_id?: string | null;
+  raw_payload?: string | null;
   created_at?: Date;
   updated_at?: Date;
 }

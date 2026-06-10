@@ -289,7 +289,7 @@ export const updateLeadAgents = async (
       .set({
         assigned_agent: agentValue,
         owner_id: agentIdValue,
-        updated_at: new Date().toISOString().slice(0, 19).replace("T", " "),
+        updated_at: new Date(),
       })
       .where("id", "=", Number(id))
       .execute();
