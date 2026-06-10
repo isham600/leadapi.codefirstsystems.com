@@ -9,9 +9,9 @@
     "strict": false,
     "noImplicitAny": false,
     "skipLibCheck": true,
+    "noEmitOnError": false,
     "outDir": "dist",
-    "resolveJsonModule": true,
-    "noEmitOnError": false
+    "resolveJsonModule": true
   },
   "include": ["src", "src/types"]
 }
