@@ -394,7 +394,6 @@ export const submitWebFormLead = async (
             .set({
               lead_id: lead.id,
               conversion_status: "converted",
-              updated_at: new Date(),
             })
             .where("id", "=", submission.id)
             .execute();

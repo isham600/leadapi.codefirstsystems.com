@@ -539,6 +539,9 @@ export interface DB {
   pricing_profiles: PricingProfile;
   voice_slab_pricing: VoiceSlabPricing;
   billing_deduction_queue: BillingDeductionQueue;
+  web_forms: WebForm;
+  form_submissions: FormSubmission;
+  whatsapp_phone_numbers: WhatsappPhoneNumber;
 }
 
 export interface AppNotification {
@@ -750,4 +753,63 @@ export interface BillingDeductionQueue {
   error_message?: string | null;
   created_at?: Date;
   processed_at?: Date | null;
+}
+
+export interface WebForm {
+  id?: number;
+  username: string;
+  embed_key: string;
+  webhook_url: string;
+  form_title?: string | null;
+  form_description?: string | null;
+  form_fields?: any | null;
+  total_submissions?: number;
+  total_leads_created?: number;
+  allowed_origins?: any | null;
+  api_key?: string | null;
+  status: "active" | "inactive" | "archived";
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface FormSubmission {
+  id?: number;
+  form_id: number;
+  username: string;
+  first_name?: string | null;
+  last_name?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  company?: string | null;
+  message?: string | null;
+  custom_fields?: any | null;
+  utm_source?: string | null;
+  utm_medium?: string | null;
+  utm_campaign?: string | null;
+  utm_term?: string | null;
+  utm_content?: string | null;
+  referrer?: string | null;
+  page_url?: string | null;
+  lead_id?: number | null;
+  conversion_status?: "pending" | "converted" | "failed";
+  ip_address?: string | null;
+  user_agent?: string | null;
+  submitted_at: Date;
+  created_at: Date;
+}
+
+export interface WhatsappPhoneNumber {
+  id?: number;
+  waba_account_id: number;
+  phone_number_id: string;
+  phone_number: string;
+  verified_name?: string | null;
+  quality_rating?: string | null;
+  status?: string | null;
+  is_primary?: number;
+  messages_sent?: number;
+  leads_received?: number;
+  last_message_at?: Date | null;
+  created_at: Date;
+  updated_at: Date;
 }
