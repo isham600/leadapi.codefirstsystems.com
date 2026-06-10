@@ -28,7 +28,7 @@ const getLocalIP = () => {
 const start = async () => {
   const app = await buildApp();
 
-  const PORT = Number(process.env.PORT) || 3003;
+  const PORT = Number(process.env.PORT) || 3004;
   const IP = getLocalIP(); // Detect server IP automatically
 
   try {

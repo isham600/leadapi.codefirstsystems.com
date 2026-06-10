@@ -54,7 +54,7 @@ export const whatsappOAuthStart = async (
     // Redirect to Meta OAuth
     const fbAppId = process.env.FACEBOOK_APP_ID || "4373151762943238";
     const backendUrl =
-      process.env.BACKEND_URL || "http://127.0.0.1:3003";
+      process.env.BACKEND_URL || "http://127.0.0.1:3004";
     const redirectUri = `${backendUrl}/api/whatsapp/oauth/callback`;
 
     const oauthUrl = new URL("https://www.facebook.com/v21.0/dialog/oauth");
@@ -93,7 +93,7 @@ export const whatsappOAuthCallback = async (
     // Exchange code for access token
     const fbAppId = process.env.FACEBOOK_APP_ID || "4373151762943238";
     const fbAppSecret = process.env.FACEBOOK_APP_SECRET || "";
-    const backendUrl = process.env.BACKEND_URL || "http://127.0.0.1:3003";
+    const backendUrl = process.env.BACKEND_URL || "http://127.0.0.1:3004";
     const redirectUri = `${backendUrl}/api/whatsapp/oauth/callback`;
 
     const tokenUrl = new URL("https://graph.instagram.com/v21.0/oauth/access_token");

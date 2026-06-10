@@ -46,7 +46,7 @@ export const createWebForm = async (
 
     // Generate unique embed key
     const embed_key = `wf_${crypto.randomBytes(16).toString("hex")}`;
-    const webhook_url = `${process.env.BACKEND_URL || "http://127.0.0.1:3003"}/api/forms/submit?key=${embed_key}`;
+    const webhook_url = `${process.env.BACKEND_URL || "http://127.0.0.1:3004"}/api/forms/submit?key=${embed_key}`;
 
     const result = await db
       .insertInto("web_forms")

@@ -1194,7 +1194,7 @@ export const uploadAvatar = async (
 
     // File URL for frontend
     const fileUrl = `${
-      process.env.BASE_URL || "http://localhost:3003"
+      process.env.BASE_URL || "http://localhost:3004"
     }/uploads/avatar/${fileName}`;
     console.log("file url:", fileUrl);
 
