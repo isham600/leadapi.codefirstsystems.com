@@ -1,6 +1,7 @@
 import { FastifyRequest, FastifyReply } from "fastify";
 import { db } from "../../../models/db.js";
 import { notify, getUuidByUsername } from "../../../utils/notify.js";
+import { sendMetaCapiLeadEvent } from "../../meta/services/meta-lead.service.js";
 
 // Helper function to sanitize text by removing emojis and problematic characters
 const sanitizeText = (text: string | null | undefined): string => {
@@ -137,6 +138,10 @@ export const updateLead = async (
         description: `${existingLead.status} → ${updateData.status}`,
         link:     `/lead-manager?id=${leadId}`,
       });
+
+      // Conversions API: feed the status change back to Meta (fire-and-forget,
+      // no-ops unless this is a Meta lead and a pixel/dataset ID is configured)
+      sendMetaCapiLeadEvent(username, Number(leadId), updateData.status).catch(() => {});
     }
 
     // Notify on assignment change

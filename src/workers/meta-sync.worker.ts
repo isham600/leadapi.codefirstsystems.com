@@ -2,38 +2,14 @@ import { Worker, Job } from "bullmq";
 import { db } from "../models/db.js";
 import { redisConnection } from "../queues/campaign.queue.js";
 import type { MetaSyncJobData } from "../queues/meta-sync.queue.js";
+import {
+  upsertMetaLead,
+  resolveTenantId,
+  LEAD_FIELDS_FULL,
+  LEAD_FIELDS_BASIC,
+} from "../modules/meta/services/meta-lead.service.js";
 
 const META_GRAPH = "https://graph.facebook.com/v25.0";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Field helpers (same logic as lead-dispatcher + webhook handler)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function normalizePhone(raw: string | null | undefined): string | null {
-  if (!raw?.trim()) return null;
-  const cleaned = raw.trim().replace(/^\+/, "").replace(/[\s\-().]/g, "");
-  // Only keep if it looks like a phone number (digits only, 5–20 chars)
-  if (!/^\d{5,20}$/.test(cleaned)) return null;
-  return cleaned;
-}
-
-function splitName(name: string | null | undefined) {
-  if (!name?.trim()) return { first: "Unknown", last: null, full: null };
-  const parts = name.trim().split(/\s+/);
-  return {
-    first: parts[0],
-    last:  parts.length > 1 ? parts.slice(1).join(" ") : null,
-    full:  name.trim(),
-  };
-}
-
-function parseFieldData(fieldData: any[]): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const f of fieldData ?? []) {
-    if (f.name) out[f.name.toLowerCase()] = f.values?.[0] ?? "";
-  }
-  return out;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Meta Graph API helpers
@@ -63,16 +39,26 @@ async function fetchAllLeadForms(pageId: string, pageToken: string): Promise<any
 }
 
 async function fetchAllFormLeads(formId: string, pageToken: string): Promise<any[]> {
-  const all: any[] = [];
-  let url: string = `${META_GRAPH}/${formId}/leads?fields=id,created_time,field_data&limit=100&access_token=${pageToken}`;
-  while (url) {
-    const res  = await fetch(url);
-    const json: any = await res.json();
-    if (json.error) { console.error(`[metaSync] leads error for form ${formId}:`, json.error.message); break; }
-    all.push(...(json.data ?? []));
-    url = json.paging?.next ?? "";
+  // Try FULL fields (incl. campaign/adset/ad attribution) first; if the token
+  // lacks ads_read Meta rejects the whole call, so retry with BASIC fields
+  for (const fields of [LEAD_FIELDS_FULL, LEAD_FIELDS_BASIC]) {
+    const all: any[] = [];
+    let errored = false;
+    let url: string = `${META_GRAPH}/${formId}/leads?fields=${fields}&limit=100&access_token=${pageToken}`;
+    while (url) {
+      const res  = await fetch(url);
+      const json: any = await res.json();
+      if (json.error) {
+        console.error(`[metaSync] leads error for form ${formId} (fields=${fields === LEAD_FIELDS_FULL ? "full" : "basic"}):`, json.error.message);
+        errored = true;
+        break;
+      }
+      all.push(...(json.data ?? []));
+      url = json.paging?.next ?? "";
+    }
+    if (!errored) return all;
   }
-  return all;
+  return [];
 }
 
 async function fetchAllCampaigns(adAccountId: string, accessToken: string): Promise<any[]> {
@@ -88,10 +74,13 @@ async function fetchAllCampaigns(adAccountId: string, accessToken: string): Prom
   return all;
 }
 
-async function fetchCampaignInsights(adAccountId: string, accessToken: string): Promise<Map<string, any>> {
+const ALLOWED_DATE_PRESETS = new Set(["today", "yesterday", "last_7d", "last_14d", "last_30d", "last_90d", "this_month", "last_month", "maximum"]);
+
+async function fetchCampaignInsights(adAccountId: string, accessToken: string, datePreset = "last_30d"): Promise<Map<string, any>> {
   const map = new Map<string, any>();
+  const preset = ALLOWED_DATE_PRESETS.has(datePreset) ? datePreset : "last_30d";
   try {
-    const url = `${META_GRAPH}/act_${adAccountId}/insights?fields=campaign_id,spend,impressions,clicks,reach,actions&date_preset=last_30d&level=campaign&limit=100&access_token=${accessToken}`;
+    const url = `${META_GRAPH}/act_${adAccountId}/insights?fields=campaign_id,spend,impressions,clicks,reach,actions&date_preset=${preset}&level=campaign&limit=100&access_token=${accessToken}`;
     const res  = await fetch(url);
     const json: any = await res.json();
     for (const row of json.data ?? []) {
@@ -169,10 +158,9 @@ async function upsertCampaigns(username: string, adAccountId: string, campaigns:
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Lead manager sync — same dedup logic as lead-dispatcher + webhook
+// Lead manager sync — delegates to the shared meta-lead service so the
+// webhook and this worker produce identical lead records
 // ─────────────────────────────────────────────────────────────────────────────
-
-const SCORE = { INITIAL: 10, HAS_NAME: 2, HAS_PHONE: 3, HAS_EMAIL: 5, INBOUND_MESSAGE: 2 } as const;
 
 async function syncFormLeadsToLeadManager(
   username:  string,
@@ -182,198 +170,14 @@ async function syncFormLeadsToLeadManager(
   leads:     any[],
 ): Promise<number> {
   let synced = 0;
-  const now  = new Date();
-
   for (const lead of leads) {
     try {
-      const metaLeadId = String(lead.id);
-      const fields     = parseFieldData(lead.field_data ?? []);
-      const phone      = normalizePhone(fields["phone_number"] || fields["phone"]);
-      const email      = (fields["email"] || "").trim() || null;
-      const name       = fields["full_name"] || fields["name"] || null;
-      const createdAt  = lead.created_time ? new Date(lead.created_time) : now;
-
-      if (!phone && !email) continue;
-
-      // ── 1. Primary dedup: meta_lead_id (already synced from a previous run or webhook)
-      const byMetaId: any = await (db as any)
-        .selectFrom("leads")
-        .select(["id", "email", "full_name", "phone"])
-        .where("username",     "=", username)
-        .where("meta_lead_id", "=", metaLeadId)
-        .executeTakeFirst();
-
-      if (byMetaId) {
-        // Already synced — enrich missing fields only, no score bump
-        const enrichment: Record<string, any> = { updated_at: now };
-        if (name && (!byMetaId.full_name || byMetaId.full_name === "Unknown")) {
-          const n = splitName(name);
-          enrichment.first_name = n.first;
-          enrichment.last_name  = n.last;
-          enrichment.full_name  = n.full;
-        }
-        if (email && !byMetaId.email) enrichment.email = email;
-        if (phone && !byMetaId.phone) enrichment.phone = phone;
-        if (Object.keys(enrichment).length > 1) {
-          await (db as any).updateTable("leads").set(enrichment).where("id", "=", byMetaId.id).execute();
-        }
-        synced++; // count as processed
-        continue;
-      }
-
-      // ── 2. Dedup by phone + source="meta" (same channel, same phone)
-      let existing: any = null;
-      if (phone) {
-        existing = await (db as any)
-          .selectFrom("leads")
-          .select(["id", "lead_score", "email", "full_name", "phone", "meta_lead_id"])
-          .where("username",     "=", username)
-          .where("phone",        "=", phone)
-          .where("source",       "=", "meta")
-          .where("is_duplicate", "=", 0)
-          .orderBy("id", "desc")
-          .executeTakeFirst();
-      }
-
-      // ── 3. Cross-channel dedup by phone (different source, same phone)
-      let isCrossChannel = false;
-      if (!existing && phone) {
-        const crossChannel: any = await (db as any)
-          .selectFrom("leads")
-          .select(["id", "lead_score", "email", "full_name", "phone", "meta_lead_id"])
-          .where("username",     "=", username)
-          .where("phone",        "=", phone)
-          .where("is_duplicate", "=", 0)
-          .orderBy("id", "desc")
-          .executeTakeFirst();
-        if (crossChannel) {
-          isCrossChannel = true;
-          existing = crossChannel;
-        }
-      }
-
-      // ── 4. Dedup by email (any source)
-      if (!existing && email) {
-        existing = await (db as any)
-          .selectFrom("leads")
-          .select(["id", "lead_score", "email", "full_name", "phone", "meta_lead_id"])
-          .where("username", "=", username)
-          .where("email",    "=", email)
-          .executeTakeFirst();
-      }
-
-      if (existing) {
-        // ── UPDATE existing lead ─────────────────────────────
-        let newScore = (Number(existing.lead_score) || 0) + SCORE.INBOUND_MESSAGE;
-        const enrichment: Record<string, any> = {
-          lead_score:       newScore,
-          last_activity_at: createdAt,
-          updated_at:       now,
-          // Tag with meta IDs if not already set
-          ...(!existing.meta_lead_id ? { meta_lead_id: metaLeadId, meta_form_id: formId, medium: "facebook_lead_ads" } : {}),
-        };
-
-        if (name && (!existing.full_name || existing.full_name === "Unknown")) {
-          const n = splitName(name);
-          enrichment.first_name = n.first;
-          enrichment.last_name  = n.last;
-          enrichment.full_name  = n.full;
-          newScore             += SCORE.HAS_NAME;
-          enrichment.lead_score = newScore;
-        }
-        if (email && !existing.email) {
-          enrichment.email      = email;
-          newScore             += SCORE.HAS_EMAIL;
-          enrichment.lead_score = newScore;
-        }
-        if (phone && !existing.phone) {
-          enrichment.phone      = phone;
-          newScore             += SCORE.HAS_PHONE;
-          enrichment.lead_score = newScore;
-        }
-
-        await (db as any).updateTable("leads").set(enrichment).where("id", "=", existing.id).execute();
-        synced++; // count updated leads too
-
-        // Cross-channel: also insert a duplicate row so this Meta entry is recorded
-        if (isCrossChannel) {
-          const { first, last, full } = splitName(name);
-          let dupScore = SCORE.INITIAL;
-          if (name)  dupScore += SCORE.HAS_NAME;
-          if (phone) dupScore += SCORE.HAS_PHONE;
-          if (email) dupScore += SCORE.HAS_EMAIL;
-
-          await (db as any).insertInto("leads").values({
-            tenant_id:        tenantId,
-            username,
-            first_name:       first,
-            last_name:        last,
-            full_name:        full ?? phone ?? email ?? "Unknown",
-            email,
-            phone,
-            source:           "meta",
-            medium:           "facebook_lead_ads",
-            sub_source:       formName,
-            meta_lead_id:     metaLeadId,
-            meta_form_id:     formId,
-            lead_score:       dupScore,
-            status:           "NEW",
-            lifecycle:        "lead",
-            priority:         "Medium",
-            last_activity_at: createdAt,
-            is_duplicate:     1,
-            is_converted:     0,
-            is_archived:      0,
-            created_by:       username,
-            updated_by:       username,
-            created_at:       createdAt,
-            updated_at:       now,
-          }).execute();
-        }
-
-      } else {
-        // ── INSERT new lead ──────────────────────────────────
-        const { first, last, full } = splitName(name);
-        let initialScore = SCORE.INITIAL;
-        if (name)  initialScore += SCORE.HAS_NAME;
-        if (phone) initialScore += SCORE.HAS_PHONE;
-        if (email) initialScore += SCORE.HAS_EMAIL;
-
-        await (db as any).insertInto("leads").values({
-          tenant_id:        tenantId,
-          username,
-          first_name:       first,
-          last_name:        last,
-          full_name:        full ?? phone ?? email ?? "Unknown",
-          email,
-          phone,
-          source:           "meta",
-          medium:           "facebook_lead_ads",
-          sub_source:       formName,
-          meta_lead_id:     metaLeadId,
-          meta_form_id:     formId,
-          lead_score:       initialScore,
-          status:           "NEW",
-          stage:            "New",
-          lifecycle:        "lead",
-          priority:         "Medium",
-          last_activity_at: createdAt,
-          is_duplicate:     0,
-          is_converted:     0,
-          is_archived:      0,
-          created_by:       username,
-          updated_by:       username,
-          created_at:       createdAt,
-          updated_at:       now,
-        }).execute();
-      }
-
-      synced++;
+      const result = await upsertMetaLead({ username, tenantId, formId, formName, lead });
+      if (result !== "skipped") synced++;
     } catch (err: any) {
       console.error(`[metaSync] lead ${lead.id} upsert error: ${err.message}`);
     }
   }
-
   return synced;
 }
 
@@ -382,8 +186,33 @@ async function syncFormLeadsToLeadManager(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function processJob(job: Job<MetaSyncJobData>): Promise<{ forms: number; campaigns: number; leads: number }> {
-  const { username, pageId, adAccountId, accessToken, syncType } = job.data;
-  console.log(`[metaSync] processing ${username} syncType=${syncType}`, { pageId, adAccountId });
+  const { username, pageId, adAccountId, accessToken, syncType, datePreset } = job.data;
+  console.log(`[metaSync] processing ${username} syncType=${syncType}`, { pageId, adAccountId, datePreset });
+
+  // ── AUTO tick: fan out one cache-sync job per active Meta account ────────
+  if (syncType === "auto") {
+    const accounts: any[] = await (db as any)
+      .selectFrom("meta_accounts")
+      .select(["id", "username", "page_id", "ad_account_id", "access_token"])
+      .where("status", "=", "active")
+      .execute();
+
+    const { metaSyncQueue } = await import("../queues/meta-sync.queue.js");
+    for (const acct of accounts) {
+      if (!acct.page_id || !acct.access_token) continue;
+      await metaSyncQueue.add(
+        `meta-auto-cache-${acct.username}-${Date.now()}`,
+        {
+          username: acct.username, accountId: acct.id, pageId: acct.page_id,
+          adAccountId: acct.ad_account_id ?? null, accessToken: acct.access_token,
+          syncType: "cache",
+        },
+        { priority: 5 } // lower priority than user-triggered syncs
+      );
+    }
+    console.log(`[metaSync] auto tick — queued cache sync for ${accounts.length} account(s)`);
+    return { forms: 0, campaigns: 0, leads: 0 };
+  }
 
   const pageToken = await getPageToken(accessToken, pageId);
   let formCount = 0, campaignCount = 0, totalLeads = 0;
@@ -396,9 +225,11 @@ async function processJob(job: Job<MetaSyncJobData>): Promise<{ forms: number; c
     formCount = forms.length;
 
     if (adAccountId) {
+      // Ad-account endpoints need the user token (ads_read) — page tokens
+      // cannot read act_<id>/campaigns or /insights
       const [campaigns, insights] = await Promise.all([
-        fetchAllCampaigns(adAccountId, pageToken),
-        fetchCampaignInsights(adAccountId, pageToken),
+        fetchAllCampaigns(adAccountId, accessToken),
+        fetchCampaignInsights(adAccountId, accessToken, datePreset),
       ]);
       console.log(`[metaSync] fetched ${campaigns.length} campaigns for ${username}`);
       await upsertCampaigns(username, adAccountId, campaigns, insights);
@@ -408,12 +239,7 @@ async function processJob(job: Job<MetaSyncJobData>): Promise<{ forms: number; c
 
   // ── LEADS sync: fetch all form leads → lead manager ──────
   if (syncType === "leads" || syncType === "all") {
-    const userRow: any = await (db as any)
-      .selectFrom("users")
-      .select(["uuid"])
-      .where("username", "=", username)
-      .executeTakeFirst();
-    const tenantId = userRow?.uuid ?? username;
+    const tenantId = await resolveTenantId(username);
 
     // Get forms from cache (fast) or fetch live if cache sync wasn't part of this job
     let forms: any[];
@@ -446,12 +272,28 @@ async function processJob(job: Job<MetaSyncJobData>): Promise<{ forms: number; c
 // Export starter
 // ─────────────────────────────────────────────────────────────────────────────
 
+const AUTO_SYNC_EVERY_MS = 30 * 60 * 1000; // 30 minutes
+
 export function startMetaSyncWorker() {
   const worker = new Worker<MetaSyncJobData>(
     "meta-sync",
     processJob,
     { connection: redisConnection as any, concurrency: 3 }
   );
+
+  // Scheduled auto-sync: repeatable job keeps forms/campaign caches fresh
+  // without anyone clicking "Sync from Meta" (jobId dedupes registration)
+  import("../queues/meta-sync.queue.js").then(({ metaSyncQueue }) =>
+    metaSyncQueue.add(
+      "meta-auto-sync",
+      { username: "*", accountId: 0, pageId: "*", adAccountId: null, accessToken: "", syncType: "auto" },
+      { repeat: { every: AUTO_SYNC_EVERY_MS }, jobId: "meta-auto-sync" }
+    )
+  ).then(() => {
+    console.log(`[metaSync] auto-sync scheduled every ${AUTO_SYNC_EVERY_MS / 60000} min`);
+  }).catch((err) => {
+    console.error("[metaSync] failed to schedule auto-sync:", err?.message);
+  });
 
   worker.on("completed", (job, result) => {
     console.log(`[metaSync] job ${job.id} done — forms: ${result.forms}, campaigns: ${result.campaigns}, leads synced: ${result.leads}`);

@@ -16,11 +16,33 @@ import {
   createLeadFormApi,
   getFormLeads,
   getInsights,
+  getInsightsTimeseries,
+  getAdAccountInfo,
+  getTokenHealth,
   getCampaigns,
   createCampaign,
   updateCampaignStatus,
+  deleteCampaign,
   syncMetaData,
   syncMetaLeads,
+  getSyncStatus,
+  getFormQuestions,
+  getFieldMap,
+  saveFieldMap,
+  uploadAdImage,
+  uploadAdVideo,
+  targetingSearch,
+  getCampaignAdsets,
+  getAdsetAds,
+  updateAdset,
+  listCustomAudiences,
+  createCustomAudience,
+  getCampaignRoi,
+  capiLeadEvent,
+  updateFormStatus,
+  duplicateLeadForm,
+  listMetaAccounts,
+  activateMetaAccount,
   MetaOAuthCallbackQuery,
   MetaFormCreateBody,
 } from "../controllers/meta.controller.js";
@@ -61,17 +83,50 @@ export default async function metaRoutes(fastify: FastifyInstance) {
   fastify.get("/lead-forms",                   { preHandler: verifyJwt }, getLeadForms);
   fastify.post("/lead-forms",                  { preHandler: verifyJwt }, createLeadFormApi);
   fastify.get("/lead-forms/:formId/leads",     { preHandler: verifyJwt }, getFormLeads);
-  fastify.get("/insights",    { preHandler: verifyJwt }, getInsights);
+  fastify.get("/lead-forms/:formId/questions", { preHandler: verifyJwt }, getFormQuestions);
+  fastify.get("/lead-forms/:formId/field-map", { preHandler: verifyJwt }, getFieldMap);
+  fastify.put("/lead-forms/:formId/field-map", { preHandler: verifyJwt }, saveFieldMap);
+  fastify.get("/insights",            { preHandler: verifyJwt }, getInsights);
+  fastify.get("/insights-timeseries", { preHandler: verifyJwt }, getInsightsTimeseries);
+  fastify.get("/ad-account-info",     { preHandler: verifyJwt }, getAdAccountInfo);
+  fastify.get("/token-health",        { preHandler: verifyJwt }, getTokenHealth);
 
   // Background sync — cache (lead forms list + campaigns)
   fastify.post("/sync",       { preHandler: verifyJwt }, syncMetaData);
   // Background sync — pull all Meta leads into lead manager
   fastify.post("/sync-leads", { preHandler: verifyJwt }, syncMetaLeads);
+  // Real job state for frontend polling
+  fastify.get("/sync-status/:jobId", { preHandler: verifyJwt }, getSyncStatus);
 
   // Campaigns
   fastify.get("/campaigns",        { preHandler: verifyJwt }, getCampaigns);
   fastify.post("/campaigns",       { preHandler: verifyJwt }, createCampaign);
   fastify.patch("/campaigns/:id",  { preHandler: verifyJwt }, updateCampaignStatus);
+  fastify.delete("/campaigns/:id", { preHandler: verifyJwt }, deleteCampaign);
+  fastify.get("/campaigns/:id/adsets", { preHandler: verifyJwt }, getCampaignAdsets);
+  fastify.get("/adsets/:id/ads",       { preHandler: verifyJwt }, getAdsetAds);
+  fastify.patch("/adsets/:id",         { preHandler: verifyJwt }, updateAdset);
+  fastify.get("/campaign-roi",         { preHandler: verifyJwt }, getCampaignRoi);
+
+  // Creative + targeting helpers
+  fastify.post("/ad-images",        { preHandler: verifyJwt }, uploadAdImage);
+  fastify.post("/ad-videos",        { preHandler: verifyJwt }, uploadAdVideo);
+  fastify.get("/targeting-search",  { preHandler: verifyJwt }, targetingSearch);
+
+  // Custom audiences
+  fastify.get("/custom-audiences",  { preHandler: verifyJwt }, listCustomAudiences);
+  fastify.post("/custom-audiences", { preHandler: verifyJwt }, createCustomAudience);
+
+  // Conversions API (also fires automatically on lead status change)
+  fastify.post("/capi/lead-event",  { preHandler: verifyJwt }, capiLeadEvent);
+
+  // Form management
+  fastify.post("/lead-forms/:formId/status",    { preHandler: verifyJwt }, updateFormStatus);
+  fastify.post("/lead-forms/:formId/duplicate", { preHandler: verifyJwt }, duplicateLeadForm);
+
+  // Multi-account
+  fastify.get("/accounts",               { preHandler: verifyJwt }, listMetaAccounts);
+  fastify.post("/accounts/:id/activate", { preHandler: verifyJwt }, activateMetaAccount);
 
   // Meta webhook (verification + lead delivery)
   fastify.route({

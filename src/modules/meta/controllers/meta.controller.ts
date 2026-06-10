@@ -3,6 +3,14 @@ import { db } from "../../../models/db.js";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { metaSyncQueue } from "../../../queues/meta-sync.queue.js";
+import {
+  upsertMetaLead,
+  resolveTenantId,
+  LEAD_FIELDS_FULL,
+  LEAD_FIELDS_BASIC,
+  CRM_FIELD_ALLOWLIST,
+  sendMetaCapiLeadEvent,
+} from "../services/meta-lead.service.js";
 
 const META_AUTH_BASE = "https://www.facebook.com/v25.0/dialog/oauth";
 const META_GRAPH_BASE = "https://graph.facebook.com/v25.0";
@@ -890,12 +898,8 @@ export const metaWebhook = async (req: FastifyRequest, reply: FastifyReply) => {
 
     // Use meta_accounts token (page token) — more reliable than users.meta_access_token
     const acct = await getActiveAccount(client_username);
-    const userRow = await db
-      .selectFrom("users")
-      .select(["tenant_id"] as any)
-      .where("username", "=", client_username)
-      .executeTakeFirst();
-    const tenant_id = (userRow as any)?.tenant_id;
+    // Canonical tenant key — users.uuid, same as the sync worker (P0-2 fix)
+    const tenant_id = await resolveTenantId(client_username);
 
     if (!acct?.access_token) {
       return reply.status(200).send({ received: false });
@@ -906,43 +910,46 @@ export const metaWebhook = async (req: FastifyRequest, reply: FastifyReply) => {
       ? await getPageToken(acct.access_token, acct.page_id)
       : acct.access_token;
 
-    const leadRes = await fetch(
-      `${META_GRAPH_BASE}/${encodeURIComponent(leadgen_id)}?access_token=${encodeURIComponent(access_token)}&fields=field_data,created_time`
-    );
+    // Fetch the lead — FULL fields include campaign/adset/ad attribution but
+    // need ads_read on the token; fall back to BASIC so capture never breaks
+    let leadJson: any = null;
+    for (const leadFields of [LEAD_FIELDS_FULL, LEAD_FIELDS_BASIC]) {
+      const leadRes = await fetch(
+        `${META_GRAPH_BASE}/${encodeURIComponent(leadgen_id)}?access_token=${encodeURIComponent(access_token)}&fields=${leadFields}`
+      );
+      const json: any = await leadRes.json().catch(() => null);
+      if (json && !json.error) { leadJson = json; break; }
+      req.log.warn({ leadgen_id, error: json?.error?.message }, "Meta lead fetch failed, retrying with basic fields");
+    }
 
-    if (!leadRes.ok) {
+    if (!leadJson) {
       return reply.status(200).send({ received: false });
     }
 
-    const leadJson: any = await leadRes.json();
+    // Webhook payload carries ad_id even when the lead fetch couldn't
+    leadJson.id    ??= leadgen_id;
+    leadJson.ad_id ??= value?.ad_id;
 
-    // Parse field_data into structured fields
-    const fields: Record<string, string> = {};
-    (leadJson.field_data ?? []).forEach((f: any) => {
-      fields[f.name?.toLowerCase()] = f.values?.[0] ?? "";
+    // Form name for sub_source (best effort, from cache)
+    const formRowName: any = await (db as any)
+      .selectFrom("meta_lead_forms_cache")
+      .select(["name"])
+      .where("form_id", "=", String(form_id))
+      .where("username", "=", client_username)
+      .executeTakeFirst()
+      .catch(() => null);
+
+    // Same normalization / dedup / scoring path as the sync worker (P0-3 fix)
+    const result = await upsertMetaLead({
+      username:   client_username,
+      tenantId:   tenant_id,
+      formId:     String(form_id),
+      formName:   formRowName?.name ?? null,
+      lead:       leadJson,
+      rawPayload: JSON.stringify(leadJson),
     });
-    const full_name = fields["full_name"] || fields["name"] || null;
-    const email     = fields["email"] || null;
-    const phone     = fields["phone_number"] || fields["phone"] || null;
 
-    await db.insertInto("leads").values({
-      tenant_id,
-      username: client_username,
-      full_name,
-      email,
-      phone,
-      source: "meta",
-      medium: "facebook_lead_ads",
-      meta_form_id: String(form_id),
-      meta_lead_id: leadgen_id,
-      raw_payload: JSON.stringify(leadJson),
-      status: "NEW",
-      lifecycle: "lead",
-      created_at: new Date(),
-      updated_at: new Date(),
-    }).execute();
-
-    return reply.status(200).send({ received: true, mode: "real" });
+    return reply.status(200).send({ received: true, mode: "real", result });
 
   } catch (error) {
     req.log.error(error, "Meta webhook processing failed");
@@ -1366,9 +1373,15 @@ export const createLeadFormApi = async (req: FastifyRequest, reply: FastifyReply
     thank_you_description,
     cta_button_text,
     cta_button_url,
+    custom_disclaimer,   // { title, body_text, checkboxes: [{ text, is_required }] }
   } = body;
 
   if (!name) return reply.status(400).send({ status: 0, message: "Form name is required" });
+
+  // Meta requires a real, working privacy policy URL — never default to a fake one
+  if (!privacy_policy_url || !/^https?:\/\/.+\..+/i.test(String(privacy_policy_url).trim())) {
+    return reply.status(400).send({ status: 0, message: "A valid privacy_policy_url (https://…) is required" });
+  }
 
   const thankYouTitle = thank_you_title ?? thank_you_message ?? "Thank you!";
   const thankYouBody  = thank_you_description ?? "We will get back to you soon.";
@@ -1381,7 +1394,7 @@ export const createLeadFormApi = async (req: FastifyRequest, reply: FastifyReply
       { type: "EMAIL" },
       { type: "PHONE" },
     ],
-    privacy_policy: { url: privacy_policy_url ?? "https://example.com/privacy" },
+    privacy_policy: { url: String(privacy_policy_url).trim() },
     thank_you_page: {
       title: thankYouTitle,
       body: thankYouBody,
@@ -1392,6 +1405,23 @@ export const createLeadFormApi = async (req: FastifyRequest, reply: FastifyReply
         style: "LIST_STYLE",
         title: intro_headline,
         ...(intro_description ? { content: [intro_description] } : {}),
+      },
+    } : {}),
+    // GDPR / consent: custom disclaimer with consent checkboxes
+    ...(custom_disclaimer?.title || custom_disclaimer?.body_text || custom_disclaimer?.checkboxes?.length ? {
+      custom_disclaimer: {
+        ...(custom_disclaimer.title ? { title: custom_disclaimer.title } : {}),
+        ...(custom_disclaimer.body_text ? { body: { text: custom_disclaimer.body_text } } : {}),
+        ...(Array.isArray(custom_disclaimer.checkboxes) && custom_disclaimer.checkboxes.length ? {
+          checkboxes: custom_disclaimer.checkboxes
+            .filter((c: any) => c?.text?.trim())
+            .map((c: any, i: number) => ({
+              key:         `consent_${i + 1}`,
+              text:        c.text.trim(),
+              is_required: !!c.is_required,
+              is_checked_by_default: false,
+            })),
+        } : {}),
       },
     } : {}),
   };
@@ -1424,23 +1454,30 @@ export const getFormLeads = async (req: FastifyRequest, reply: FastifyReply) => 
   const { formId } = req.params as { formId: string };
   if (!formId) return reply.status(400).send({ status: 0, message: "formId required" });
 
+  // Cap how many leads we pull live from Graph in one request — uncapped
+  // pagination times out and burns rate limits on large forms
+  const q = req.query as any;
+  const limit = Math.min(Math.max(Number(q?.limit) || 500, 1), 2000);
+
   try {
     const pageToken = await getPageToken(acct.access_token, acct.page_id);
 
-    // Follow cursor pagination to fetch all leads
     const allRaw: any[] = [];
+    let hasMore = false;
     let url: string = `${META_GRAPH_BASE}/${formId}/leads?fields=id,created_time,field_data&access_token=${pageToken}&limit=100`;
 
-    while (url) {
+    while (url && allRaw.length < limit) {
       const res = await fetch(url);
       const json: any = await res.json();
       if (json.error) return reply.status(400).send({ status: 0, message: json.error.message, data: json.error });
       allRaw.push(...(json.data ?? []));
       url = json.paging?.next ?? "";
+      if (url && allRaw.length >= limit) hasMore = true;
     }
+    const capped = allRaw.slice(0, limit);
 
     // Parse field_data into flat objects for easy display
-    const leads = allRaw.map((lead: any) => {
+    const leads = capped.map((lead: any) => {
       const fields: Record<string, string> = {};
       (lead.field_data ?? []).forEach((f: any) => {
         fields[f.name] = f.values?.[0] ?? "";
@@ -1448,7 +1485,7 @@ export const getFormLeads = async (req: FastifyRequest, reply: FastifyReply) => 
       return { id: lead.id, created_time: lead.created_time, ...fields };
     });
 
-    return reply.send({ status: 1, data: leads, total: leads.length });
+    return reply.send({ status: 1, data: leads, total: leads.length, has_more: hasMore });
   } catch {
     return reply.status(500).send({ status: 0, message: "Failed to fetch leads" });
   }
@@ -1512,7 +1549,11 @@ export const createCampaign = async (req: FastifyRequest, reply: FastifyReply) =
     campaign_name, budget_type, budget_amount, bid_strategy,
     adset_name, lead_form_id, start_time, end_time,
     country, age_min, age_max,
+    gender,            // "all" | "male" | "female"
+    cities,            // [{ key, name }] from targeting-search (adgeolocation)
+    interests,         // [{ id, name }]  from targeting-search (adinterest)
     headline, primary_text, description, cta_type,
+    variant_headline, variant_primary_text,   // optional A/B creative variant
     publish,
   } = body;
 
@@ -1520,12 +1561,14 @@ export const createCampaign = async (req: FastifyRequest, reply: FastifyReply) =
     return reply.status(400).send({ status: 0, message: "campaign_name, budget_amount and lead_form_id are required" });
   }
 
-  const pageToken = await getPageToken(acct.access_token, acct.page_id);
+  // Ad-account mutations (campaign/adset/creative/ad) need the user token
+  // with ads_management — page tokens are only for page-scoped endpoints
+  const adsToken = acct.access_token;
   const campaignStatus = publish ? "ACTIVE" : "PAUSED";
   // Meta budget is in lowest currency unit (paise for INR, cents for USD)
   const budgetPaise = String(Math.round(Number(budget_amount) * 100));
 
-  const { image_url, image_hash } = body;
+  const { image_url, image_hash, video_id, carousel_cards } = body;
 
   try {
     // ── 1. Campaign ──────────────────────────────────────────────────────────
@@ -1543,7 +1586,7 @@ export const createCampaign = async (req: FastifyRequest, reply: FastifyReply) =
         status:                           campaignStatus,
         special_ad_categories:            JSON.stringify(["NONE"]),
         is_adset_budget_sharing_enabled:  "false",
-        access_token:                     pageToken,
+        access_token:                     adsToken,
       }),
     });
     const campaign: any = await c1.json();
@@ -1560,6 +1603,20 @@ export const createCampaign = async (req: FastifyRequest, reply: FastifyReply) =
     const startMs = start_time ? new Date(start_time).getTime() : nowMs;
     const isFutureStart = startMs > nowMs + 5 * 60 * 1000; // > 5 min from now
 
+    // Targeting: country (or specific cities), age, gender, interests
+    const targeting: any = {
+      geo_locations: Array.isArray(cities) && cities.length > 0
+        ? { cities: cities.map((c: any) => ({ key: String(c.key), radius: 25, distance_unit: "kilometer" })) }
+        : { countries: [country ?? "IN"] },
+      age_min: age_min ?? 18,
+      age_max: age_max ?? 65,
+    };
+    if (gender === "male")   targeting.genders = [1];
+    if (gender === "female") targeting.genders = [2];
+    if (Array.isArray(interests) && interests.length > 0) {
+      targeting.flexible_spec = [{ interests: interests.map((i: any) => ({ id: String(i.id), name: i.name })) }];
+    }
+
     const adsetParams: any = {
       name:               adset_name ?? `${campaign_name} - Ad Set`,
       campaign_id:        campaign.id,
@@ -1569,12 +1626,8 @@ export const createCampaign = async (req: FastifyRequest, reply: FastifyReply) =
       destination_type:   "ON_AD",
       promoted_object:    JSON.stringify({ page_id: acct.page_id }),
       status:             campaignStatus,
-      targeting:          JSON.stringify({
-        geo_locations: { countries: [country ?? "IN"] },
-        age_min: age_min ?? 18,
-        age_max: age_max ?? 65,
-      }),
-      access_token: pageToken,
+      targeting:          JSON.stringify(targeting),
+      access_token: adsToken,
     };
 
     if (isFutureStart) adsetParams.start_time = String(Math.floor(startMs / 1000));
@@ -1610,28 +1663,68 @@ export const createCampaign = async (req: FastifyRequest, reply: FastifyReply) =
     if (adset.error) return reply.status(400).send({ status: 0, message: adset.error.message, meta_error: adset.error });
 
     // ── 3. Ad Creative ───────────────────────────────────────────────────────
-    // - link: "http://fb.me/" required by Meta for lead gen link_data
-    // - image_hash or image_url required for image-based ads (optional if not provided)
+    // Three formats: single image (link_data), video (video_data with required
+    // thumbnail), carousel (link_data + child_attachments, 2–10 cards)
+    const callToAction = {
+      type:  cta_type ?? "SIGN_UP",
+      value: { lead_gen_form_id: lead_form_id },
+    };
+
     const linkData: any = {
       message:     primary_text ?? campaign_name,
       name:        headline     ?? campaign_name,
       description: description  ?? "",
-      link:        "http://fb.me/",
-      call_to_action: {
-        type:  cta_type ?? "SIGN_UP",
-        value: { lead_gen_form_id: lead_form_id },
-      },
+      link:        "http://fb.me/",   // required by Meta for lead gen link_data
+      call_to_action: callToAction,
     };
     if (image_hash) linkData.image_hash = image_hash;
     else if (image_url) linkData.picture = image_url;
+
+    let objectStorySpec: any;
+    if (video_id) {
+      // Video ad — Meta requires a thumbnail image alongside the video
+      if (!image_hash && !image_url) {
+        return reply.status(400).send({ status: 0, message: "A thumbnail image is required for video ads" });
+      }
+      objectStorySpec = {
+        page_id: acct.page_id,
+        video_data: {
+          video_id:         String(video_id),
+          message:          primary_text ?? campaign_name,
+          title:            headline ?? campaign_name,
+          link_description: description ?? "",
+          ...(image_hash ? { image_hash } : { image_url }),
+          call_to_action: callToAction,
+        },
+      };
+    } else if (Array.isArray(carousel_cards) && carousel_cards.length >= 2) {
+      objectStorySpec = {
+        page_id: acct.page_id,
+        link_data: {
+          message: primary_text ?? campaign_name,
+          link:    "http://fb.me/",
+          call_to_action: callToAction,
+          multi_share_optimized: true,
+          child_attachments: carousel_cards.slice(0, 10).map((c: any) => ({
+            link:        "http://fb.me/",
+            name:        c.headline ?? headline ?? campaign_name,
+            description: c.description ?? "",
+            image_hash:  c.image_hash,
+            call_to_action: callToAction,
+          })),
+        },
+      };
+    } else {
+      objectStorySpec = { page_id: acct.page_id, link_data: linkData };
+    }
 
     const c3 = await fetch(`${META_GRAPH_BASE}/act_${acct.ad_account_id}/adcreatives`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         name:              `${campaign_name} - Creative`,
-        object_story_spec: JSON.stringify({ page_id: acct.page_id, link_data: linkData }),
-        access_token:      pageToken,
+        object_story_spec: JSON.stringify(objectStorySpec),
+        access_token:      adsToken,
       }),
     });
     const creative: any = await c3.json();
@@ -1646,16 +1739,57 @@ export const createCampaign = async (req: FastifyRequest, reply: FastifyReply) =
         adset_id:     adset.id,
         creative:     JSON.stringify({ creative_id: creative.id }),
         status:       campaignStatus,
-        access_token: pageToken,
+        access_token: adsToken,
       }),
     });
     const ad: any = await c4.json();
     if (ad.error) return reply.status(400).send({ status: 0, message: ad.error.message, meta_error: ad.error });
 
+    // ── 5. Optional A/B variant: second creative + ad in the same ad set ────
+    // Meta splits delivery between the ads and optimizes toward the winner.
+    // Single-image format only — video/carousel variants aren't supported here.
+    let variantAdId: string | null = null;
+    const isSingleImage = !video_id && !(Array.isArray(carousel_cards) && carousel_cards.length >= 2);
+    if (isSingleImage && (variant_headline?.trim() || variant_primary_text?.trim())) {
+      const variantLinkData: any = {
+        ...linkData,
+        message: variant_primary_text?.trim() || linkData.message,
+        name:    variant_headline?.trim()     || linkData.name,
+      };
+      const v1 = await fetch(`${META_GRAPH_BASE}/act_${acct.ad_account_id}/adcreatives`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          name:              `${campaign_name} - Creative B`,
+          object_story_spec: JSON.stringify({ page_id: acct.page_id, link_data: variantLinkData }),
+          access_token:      adsToken,
+        }),
+      });
+      const creativeB: any = await v1.json();
+      if (!creativeB.error) {
+        const v2 = await fetch(`${META_GRAPH_BASE}/act_${acct.ad_account_id}/ads`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            name:         `${campaign_name} - Ad B`,
+            adset_id:     adset.id,
+            creative:     JSON.stringify({ creative_id: creativeB.id }),
+            status:       campaignStatus,
+            access_token: adsToken,
+          }),
+        });
+        const adB: any = await v2.json();
+        if (!adB.error) variantAdId = adB.id;
+        else req.log.warn({ err: adB.error.message }, "A/B variant ad creation failed — campaign still created");
+      } else {
+        req.log.warn({ err: creativeB.error.message }, "A/B variant creative failed — campaign still created");
+      }
+    }
+
     return reply.send({
       status: 1,
       message: publish ? "Campaign published successfully" : "Campaign saved as draft",
-      data: { campaign_id: campaign.id, adset_id: adset.id, creative_id: creative.id, ad_id: ad.id },
+      data: { campaign_id: campaign.id, adset_id: adset.id, creative_id: creative.id, ad_id: ad.id, variant_ad_id: variantAdId },
     });
   } catch (err: any) {
     return reply.status(500).send({ status: 0, message: err?.message ?? "Campaign creation failed" });
@@ -1672,20 +1806,69 @@ export const updateCampaignStatus = async (req: FastifyRequest, reply: FastifyRe
   if (!acct) return reply.status(400).send({ status: 0, message: "No Meta account" });
 
   const { id } = req.params as any;
-  const { status } = req.body as any;
-  const pageToken = await getPageToken(acct.access_token, acct.page_id);
+  const { status, name } = req.body as any;
+  if (!status && !name) return reply.status(400).send({ status: 0, message: "Nothing to update" });
+
+  // Campaign mutations need the user token (ads_management), not a page token
+  const params = new URLSearchParams({ access_token: acct.access_token });
+  if (status) params.set("status", status);
+  if (name)   params.set("name", name);
 
   try {
     const res = await fetch(`${META_GRAPH_BASE}/${id}`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ status, access_token: pageToken }),
+      body: params,
     });
     const json: any = await res.json();
     if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
-    return reply.send({ status: 1, message: `Campaign ${status.toLowerCase()}` });
+
+    // Keep the local cache in step so the UI reflects the change immediately
+    const cacheUpdate: Record<string, any> = { synced_at: new Date() };
+    if (status) cacheUpdate.status = status;
+    if (name)   cacheUpdate.name = name;
+    await (db as any)
+      .updateTable("meta_campaigns_cache")
+      .set(cacheUpdate)
+      .where("username", "=", username)
+      .where("campaign_id", "=", String(id))
+      .execute()
+      .catch(() => {});
+
+    return reply.send({ status: 1, message: status ? `Campaign ${String(status).toLowerCase()}` : "Campaign updated" });
   } catch {
     return reply.status(500).send({ status: 0, message: "Failed to update campaign" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/meta/campaigns/:id — delete campaign on Meta + remove from cache
+// ─────────────────────────────────────────────────────────────────────────────
+export const deleteCampaign = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+  const acct = await getActiveAccount(username);
+  if (!acct) return reply.status(400).send({ status: 0, message: "No Meta account" });
+
+  const { id } = req.params as any;
+
+  try {
+    const res = await fetch(`${META_GRAPH_BASE}/${id}?access_token=${encodeURIComponent(acct.access_token)}`, {
+      method: "DELETE",
+    });
+    const json: any = await res.json();
+    if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
+
+    await (db as any)
+      .deleteFrom("meta_campaigns_cache")
+      .where("username", "=", username)
+      .where("campaign_id", "=", String(id))
+      .execute()
+      .catch(() => {});
+
+    return reply.send({ status: 1, message: "Campaign deleted" });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Failed to delete campaign" });
   }
 };
 
@@ -1700,7 +1883,8 @@ export const getMetaAccount = async (req: FastifyRequest, reply: FastifyReply) =
     .selectFrom("meta_accounts")
     .select([
       "id", "page_id", "page_name", "ssid", "access_token_type",
-      "ad_account_id", "business_id", "instagram_account_id",
+      "ad_account_id", "business_id", "instagram_account_id", "pixel_id",
+      "access_token",
       "status", "created_at", "updated_at",
     ])
     .where("username", "=", username)
@@ -1708,7 +1892,17 @@ export const getMetaAccount = async (req: FastifyRequest, reply: FastifyReply) =
     .orderBy("id", "desc")
     .executeTakeFirst();
 
-  return reply.send({ status: 1, statuscode: 200, message: "OK", data: account ?? null });
+  if (!account) return reply.send({ status: 1, statuscode: 200, message: "OK", data: null });
+
+  // Never echo the raw token to the browser — masked preview only
+  const { access_token, ...safe } = account;
+  const data = {
+    ...safe,
+    has_access_token: !!access_token,
+    access_token_preview: access_token ? `••••••••${String(access_token).slice(-4)}` : null,
+  };
+
+  return reply.send({ status: 1, statuscode: 200, message: "OK", data });
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1720,23 +1914,30 @@ export const upsertMetaAccount = async (req: FastifyRequest, reply: FastifyReply
 
   const body = req.body as any;
   const { access_token, page_id, page_name, access_token_type, ssid,
-          ad_account_id, business_id, instagram_account_id } = body;
+          ad_account_id, business_id, instagram_account_id, pixel_id,
+          new_account } = body;
 
-  if (!access_token) {
-    return reply.status(400).send({ status: 0, message: "access_token is required" });
-  }
-
-  const existing = await (db as any)
+  // new_account=true forces an INSERT (additional page/ad-account for this
+  // client); the new row becomes the active one, others are deactivated
+  const existing = new_account ? null : await (db as any)
     .selectFrom("meta_accounts")
     .select(["id"])
     .where("username", "=", username)
+    .where("status", "=", "active")
+    .orderBy("id", "desc")
     .executeTakeFirst();
+
+  // Token required only on first save — updates keep the stored token
+  // unless a new one is provided (so users never need to re-paste it)
+  if (!access_token && !existing) {
+    return reply.status(400).send({ status: 0, message: "access_token is required" });
+  }
 
   if (existing) {
     await (db as any)
       .updateTable("meta_accounts")
       .set({
-        access_token,
+        ...(access_token ? { access_token } : {}),
         access_token_type: access_token_type ?? "page",
         page_id:            page_id            ?? null,
         page_name:          page_name          ?? null,
@@ -1744,10 +1945,11 @@ export const upsertMetaAccount = async (req: FastifyRequest, reply: FastifyReply
         ad_account_id:      ad_account_id      ?? null,
         business_id:        business_id        ?? null,
         instagram_account_id: instagram_account_id ?? null,
+        pixel_id:           pixel_id           ?? null,
         status: "active",
         updated_at: new Date(),
       })
-      .where("username", "=", username)
+      .where("id", "=", existing.id)
       .execute();
   } else {
     const userRow: any = await (db as any)
@@ -1755,6 +1957,15 @@ export const upsertMetaAccount = async (req: FastifyRequest, reply: FastifyReply
       .select(["uuid"])
       .where("username", "=", username)
       .executeTakeFirst();
+
+    // Adding a new account: deactivate the others first (one active at a time)
+    if (new_account) {
+      await (db as any)
+        .updateTable("meta_accounts")
+        .set({ status: "inactive", updated_at: new Date() })
+        .where("username", "=", username)
+        .execute();
+    }
 
     await (db as any)
       .insertInto("meta_accounts")
@@ -1769,6 +1980,7 @@ export const upsertMetaAccount = async (req: FastifyRequest, reply: FastifyReply
         ad_account_id:      ad_account_id      ?? null,
         business_id:        business_id        ?? null,
         instagram_account_id: instagram_account_id ?? null,
+        pixel_id:           pixel_id           ?? null,
         app_id:             process.env.META_APP_ID             ?? null,
         app_secret:         process.env.META_APP_SECRET         ?? null,
         redirect_uri:       process.env.META_REDIRECT_URI       ?? null,
@@ -1809,13 +2021,15 @@ export const syncMetaData = async (req: FastifyRequest, reply: FastifyReply) => 
   const acct = await getActiveAccount(username);
   if (!acct?.page_id) return reply.status(400).send({ status: 0, message: "No Meta page connected" });
 
-  await metaSyncQueue.add(
+  const datePreset = (req.body as any)?.date_preset ?? "last_30d";
+
+  const job = await metaSyncQueue.add(
     `meta-sync-cache-${username}-${Date.now()}`,
-    { username, accountId: acct.id, pageId: acct.page_id, adAccountId: acct.ad_account_id ?? null, accessToken: acct.access_token, syncType: "cache" },
+    { username, accountId: acct.id, pageId: acct.page_id, adAccountId: acct.ad_account_id ?? null, accessToken: acct.access_token, syncType: "cache", datePreset },
     { priority: 1 }
   );
 
-  return reply.status(202).send({ status: 1, message: "Cache sync queued — lead forms & campaigns will refresh in a few seconds" });
+  return reply.status(202).send({ status: 1, message: "Cache sync queued — lead forms & campaigns will refresh in a few seconds", job_id: job.id });
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1828,11 +2042,695 @@ export const syncMetaLeads = async (req: FastifyRequest, reply: FastifyReply) =>
   const acct = await getActiveAccount(username);
   if (!acct?.page_id) return reply.status(400).send({ status: 0, message: "No Meta page connected" });
 
-  await metaSyncQueue.add(
+  const job = await metaSyncQueue.add(
     `meta-sync-leads-${username}-${Date.now()}`,
     { username, accountId: acct.id, pageId: acct.page_id, adAccountId: acct.ad_account_id ?? null, accessToken: acct.access_token, syncType: "leads" },
     { priority: 2 }
   );
 
-  return reply.status(202).send({ status: 1, message: "Lead sync queued — leads will appear in Lead Manager shortly" });
+  return reply.status(202).send({ status: 1, message: "Lead sync queued — leads will appear in Lead Manager shortly", job_id: job.id });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/sync-status/:jobId  — real job state for frontend polling
+// ─────────────────────────────────────────────────────────────────────────────
+export const getSyncStatus = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const { jobId } = req.params as { jobId: string };
+  const job = await metaSyncQueue.getJob(jobId);
+  if (!job || job.data?.username !== username) {
+    return reply.status(404).send({ status: 0, message: "Job not found" });
+  }
+
+  const state = await job.getState(); // waiting | active | completed | failed | delayed
+  return reply.send({
+    status: 1,
+    data: {
+      state,
+      result: state === "completed" ? job.returnvalue : null,
+      failed_reason: state === "failed" ? job.failedReason : null,
+    },
+  });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/ad-account-info  — name, currency, status from the ad account
+// ─────────────────────────────────────────────────────────────────────────────
+const AD_ACCOUNT_STATUS: Record<number, string> = {
+  1: "ACTIVE", 2: "DISABLED", 3: "UNSETTLED", 7: "PENDING_RISK_REVIEW",
+  8: "PENDING_SETTLEMENT", 9: "IN_GRACE_PERIOD", 100: "PENDING_CLOSURE",
+  101: "CLOSED", 201: "ANY_ACTIVE", 202: "ANY_CLOSED",
+};
+
+export const getAdAccountInfo = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct?.ad_account_id) return reply.send({ status: 1, data: null });
+
+  try {
+    const res = await fetch(
+      `${META_GRAPH_BASE}/act_${acct.ad_account_id}?fields=name,currency,account_status,amount_spent,spend_cap,timezone_name&access_token=${acct.access_token}`
+    );
+    const json: any = await res.json();
+    if (json.error) return reply.send({ status: 1, data: null, error: json.error.message });
+    return reply.send({
+      status: 1,
+      data: {
+        id:             acct.ad_account_id,
+        name:           json.name ?? null,
+        currency:       json.currency ?? null,
+        account_status: AD_ACCOUNT_STATUS[json.account_status] ?? String(json.account_status ?? ""),
+        amount_spent:   json.amount_spent ?? null,
+        spend_cap:      json.spend_cap ?? null,
+        timezone_name:  json.timezone_name ?? null,
+      },
+    });
+  } catch {
+    return reply.send({ status: 1, data: null, error: "Failed to fetch ad account info" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/lead-forms/:formId/questions — question keys for field mapping
+// ─────────────────────────────────────────────────────────────────────────────
+export const getFormQuestions = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct?.page_id) return reply.status(400).send({ status: 0, message: "No Meta page connected" });
+
+  const { formId } = req.params as { formId: string };
+
+  try {
+    const pageToken = await getPageToken(acct.access_token, acct.page_id);
+    const res = await fetch(
+      `${META_GRAPH_BASE}/${encodeURIComponent(formId)}?fields=questions{key,label,type}&access_token=${pageToken}`
+    );
+    const json: any = await res.json();
+    if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
+
+    const questions = (json.questions ?? []).map((q: any) => ({
+      key:   String(q.key ?? "").toLowerCase(),
+      label: q.label ?? q.key ?? "",
+      type:  q.type ?? "CUSTOM",
+    }));
+    return reply.send({ status: 1, data: questions });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Failed to fetch form questions" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/lead-forms/:formId/field-map — current mapping
+// PUT /api/meta/lead-forms/:formId/field-map — replace mapping
+// ─────────────────────────────────────────────────────────────────────────────
+export const getFieldMap = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const { formId } = req.params as { formId: string };
+  const rows = await (db as any)
+    .selectFrom("meta_form_field_map")
+    .select(["meta_field", "crm_field"])
+    .where("username", "=", username)
+    .where("form_id",  "=", String(formId))
+    .execute();
+
+  return reply.send({ status: 1, data: rows, allowed_fields: CRM_FIELD_ALLOWLIST });
+};
+
+export const saveFieldMap = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const { formId } = req.params as { formId: string };
+  const { mappings } = req.body as { mappings: Array<{ meta_field: string; crm_field: string }> };
+
+  if (!Array.isArray(mappings)) {
+    return reply.status(400).send({ status: 0, message: "mappings array required" });
+  }
+
+  const valid = mappings.filter(
+    (m) => m?.meta_field?.trim() && (CRM_FIELD_ALLOWLIST as readonly string[]).includes(m?.crm_field)
+  );
+
+  // Replace-all semantics: simple and predictable for a per-form config
+  await (db as any)
+    .deleteFrom("meta_form_field_map")
+    .where("username", "=", username)
+    .where("form_id",  "=", String(formId))
+    .execute();
+
+  for (const m of valid) {
+    await (db as any)
+      .insertInto("meta_form_field_map")
+      .values({
+        username,
+        form_id:    String(formId),
+        meta_field: m.meta_field.trim().toLowerCase(),
+        crm_field:  m.crm_field,
+        created_at: new Date(),
+        updated_at: new Date(),
+      })
+      .execute()
+      .catch(() => {}); // duplicate meta_field in payload — keep first
+  }
+
+  return reply.send({ status: 1, message: `Saved ${valid.length} field mapping${valid.length === 1 ? "" : "s"}` });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/token-health — debug_token: validity + expiry + scopes
+// ─────────────────────────────────────────────────────────────────────────────
+export const getTokenHealth = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct?.access_token) return reply.send({ status: 1, data: null });
+
+  const appId     = acct.app_id     ?? process.env.META_APP_ID;
+  const appSecret = acct.app_secret ?? process.env.META_APP_SECRET;
+  if (!appId || !appSecret) return reply.send({ status: 1, data: null, error: "App credentials not configured" });
+
+  try {
+    const res = await fetch(
+      `${META_GRAPH_BASE}/debug_token?input_token=${encodeURIComponent(acct.access_token)}&access_token=${encodeURIComponent(`${appId}|${appSecret}`)}`
+    );
+    const json: any = await res.json();
+    const d = json?.data;
+    if (!d) return reply.send({ status: 1, data: null, error: json?.error?.message ?? "debug_token failed" });
+
+    const expiresAt = d.expires_at ? new Date(d.expires_at * 1000) : null; // 0 = never expires
+    const daysLeft  = expiresAt ? Math.floor((expiresAt.getTime() - Date.now()) / 86_400_000) : null;
+
+    return reply.send({
+      status: 1,
+      data: {
+        is_valid:   !!d.is_valid,
+        expires_at: expiresAt,
+        days_left:  daysLeft,           // null = never expires
+        scopes:     d.scopes ?? [],
+        type:       d.type ?? null,
+      },
+    });
+  } catch {
+    return reply.send({ status: 1, data: null, error: "Failed to check token" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/insights-timeseries — daily series for the analytics chart
+// ─────────────────────────────────────────────────────────────────────────────
+export const getInsightsTimeseries = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct?.ad_account_id) return reply.send({ status: 1, data: [] });
+
+  const q = req.query as any;
+  const preset = q.date_preset ?? "last_30d";
+
+  try {
+    const res = await fetch(
+      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=spend,impressions,clicks,reach,cpm,frequency,actions&date_preset=${preset}&time_increment=1&limit=500&access_token=${acct.access_token}`
+    );
+    const json: any = await res.json();
+    if (json.error) return reply.send({ status: 1, data: [], error: json.error.message });
+
+    const series = (json.data ?? []).map((row: any) => ({
+      date:        row.date_start,
+      spend:       Number(row.spend ?? 0),
+      impressions: Number(row.impressions ?? 0),
+      clicks:      Number(row.clicks ?? 0),
+      reach:       Number(row.reach ?? 0),
+      cpm:         Number(row.cpm ?? 0),
+      frequency:   Number(row.frequency ?? 0),
+      leads:       Number((row.actions ?? []).find((a: any) => a.action_type === "lead")?.value ?? 0),
+    }));
+
+    return reply.send({ status: 1, data: series });
+  } catch {
+    return reply.send({ status: 1, data: [], error: "Failed to fetch timeseries" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/meta/ad-images — upload creative image, returns image_hash
+// ─────────────────────────────────────────────────────────────────────────────
+export const uploadAdImage = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct?.ad_account_id) return reply.status(400).send({ status: 0, message: "No ad account linked" });
+
+  const { image_base64 } = req.body as { image_base64?: string };
+  if (!image_base64) return reply.status(400).send({ status: 0, message: "image_base64 required" });
+  // Strip data-URL prefix if present
+  const b64 = image_base64.replace(/^data:image\/\w+;base64,/, "");
+  if (b64.length > 11_000_000) return reply.status(400).send({ status: 0, message: "Image too large (max ~8MB)" });
+
+  try {
+    const res = await fetch(`${META_GRAPH_BASE}/act_${acct.ad_account_id}/adimages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ bytes: b64, access_token: acct.access_token }),
+    });
+    const json: any = await res.json();
+    if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
+    const img: any = Object.values(json.images ?? {})[0];
+    if (!img?.hash) return reply.status(400).send({ status: 0, message: "Upload succeeded but no image hash returned" });
+    return reply.send({ status: 1, data: { image_hash: img.hash, url: img.url ?? null } });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Image upload failed" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/meta/ad-videos — upload creative video, returns video_id
+// ─────────────────────────────────────────────────────────────────────────────
+export const uploadAdVideo = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct?.ad_account_id) return reply.status(400).send({ status: 0, message: "No ad account linked" });
+
+  const { video_base64, filename } = req.body as { video_base64?: string; filename?: string };
+  if (!video_base64) return reply.status(400).send({ status: 0, message: "video_base64 required" });
+  const b64 = video_base64.replace(/^data:video\/\w+;base64,/, "");
+  if (b64.length > 80_000_000) return reply.status(400).send({ status: 0, message: "Video too large (max ~55MB)" });
+
+  try {
+    const buf = Buffer.from(b64, "base64");
+    const form = new FormData();
+    form.append("access_token", acct.access_token);
+    form.append("source", new Blob([buf], { type: "video/mp4" }), filename ?? "ad-video.mp4");
+
+    const res = await fetch(`${META_GRAPH_BASE}/act_${acct.ad_account_id}/advideos`, {
+      method: "POST",
+      body: form as any,
+    });
+    const json: any = await res.json();
+    if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
+    if (!json.id)   return reply.status(400).send({ status: 0, message: "Upload succeeded but no video id returned" });
+    return reply.send({ status: 1, data: { video_id: json.id } });
+  } catch (err: any) {
+    return reply.status(500).send({ status: 0, message: err?.message ?? "Video upload failed" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/targeting-search?type=adinterest|adgeolocation&q=…
+// ─────────────────────────────────────────────────────────────────────────────
+export const targetingSearch = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct?.access_token) return reply.status(400).send({ status: 0, message: "No Meta account" });
+
+  const { type, q } = req.query as { type?: string; q?: string };
+  if (!q?.trim()) return reply.send({ status: 1, data: [] });
+  const searchType = type === "adgeolocation" ? "adgeolocation" : "adinterest";
+
+  try {
+    const params = new URLSearchParams({
+      type: searchType,
+      q: q.trim(),
+      limit: "10",
+      access_token: acct.access_token,
+    });
+    if (searchType === "adgeolocation") params.set("location_types", JSON.stringify(["city"]));
+    const res = await fetch(`${META_GRAPH_BASE}/search?${params}`);
+    const json: any = await res.json();
+    if (json.error) return reply.send({ status: 1, data: [], error: json.error.message });
+
+    const data = (json.data ?? []).map((r: any) =>
+      searchType === "adinterest"
+        ? { id: r.id, name: r.name, audience_size: r.audience_size_upper_bound ?? null }
+        : { key: r.key, name: r.name, region: r.region ?? null, country_name: r.country_name ?? null });
+    return reply.send({ status: 1, data });
+  } catch {
+    return reply.send({ status: 1, data: [], error: "Search failed" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/campaigns/:id/adsets — ad sets with 30d insights
+// GET /api/meta/adsets/:id/ads — ads with creative + 30d insights
+// PATCH /api/meta/adsets/:id — edit budget / end_time / status / name
+// ─────────────────────────────────────────────────────────────────────────────
+const ADSET_FIELDS = "id,name,status,daily_budget,lifetime_budget,start_time,end_time,insights.date_preset(last_30d){spend,impressions,clicks,actions}";
+const AD_FIELDS    = "id,name,status,creative{title,body,thumbnail_url},insights.date_preset(last_30d){spend,impressions,clicks,actions}";
+
+function flattenInsights(row: any) {
+  const ins = row.insights?.data?.[0] ?? {};
+  return {
+    spend:       ins.spend       ? Number(ins.spend)       : null,
+    impressions: ins.impressions ? Number(ins.impressions) : null,
+    clicks:      ins.clicks      ? Number(ins.clicks)      : null,
+    leads:       Number((ins.actions ?? []).find((a: any) => a.action_type === "lead")?.value ?? 0) || null,
+  };
+}
+
+export const getCampaignAdsets = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+  const acct = await getActiveAccount(username);
+  if (!acct?.access_token) return reply.status(400).send({ status: 0, message: "No Meta account" });
+
+  const { id } = req.params as any;
+  try {
+    const res = await fetch(`${META_GRAPH_BASE}/${id}/adsets?fields=${encodeURIComponent(ADSET_FIELDS)}&limit=50&access_token=${encodeURIComponent(acct.access_token)}`);
+    const json: any = await res.json();
+    if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
+    const data = (json.data ?? []).map((a: any) => ({
+      id: a.id, name: a.name, status: a.status,
+      daily_budget: a.daily_budget ?? null, lifetime_budget: a.lifetime_budget ?? null,
+      start_time: a.start_time ?? null, end_time: a.end_time ?? null,
+      ...flattenInsights(a),
+    }));
+    return reply.send({ status: 1, data });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Failed to fetch ad sets" });
+  }
+};
+
+export const getAdsetAds = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+  const acct = await getActiveAccount(username);
+  if (!acct?.access_token) return reply.status(400).send({ status: 0, message: "No Meta account" });
+
+  const { id } = req.params as any;
+  try {
+    const res = await fetch(`${META_GRAPH_BASE}/${id}/ads?fields=${encodeURIComponent(AD_FIELDS)}&limit=50&access_token=${encodeURIComponent(acct.access_token)}`);
+    const json: any = await res.json();
+    if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
+    const data = (json.data ?? []).map((a: any) => ({
+      id: a.id, name: a.name, status: a.status,
+      headline: a.creative?.title ?? null, body: a.creative?.body ?? null,
+      thumbnail_url: a.creative?.thumbnail_url ?? null,
+      ...flattenInsights(a),
+    }));
+    return reply.send({ status: 1, data });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Failed to fetch ads" });
+  }
+};
+
+export const updateAdset = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+  const acct = await getActiveAccount(username);
+  if (!acct?.access_token) return reply.status(400).send({ status: 0, message: "No Meta account" });
+
+  const { id } = req.params as any;
+  const { status, name, daily_budget, lifetime_budget, end_time } = req.body as any;
+
+  const params = new URLSearchParams({ access_token: acct.access_token });
+  if (status) params.set("status", status);
+  if (name)   params.set("name", name);
+  // Budgets arrive in major units from the UI → convert to minor units
+  if (daily_budget)    params.set("daily_budget",    String(Math.round(Number(daily_budget) * 100)));
+  if (lifetime_budget) params.set("lifetime_budget", String(Math.round(Number(lifetime_budget) * 100)));
+  if (end_time)        params.set("end_time", String(Math.floor(new Date(end_time).getTime() / 1000)));
+  if ([...params.keys()].length <= 1) return reply.status(400).send({ status: 0, message: "Nothing to update" });
+
+  try {
+    const res = await fetch(`${META_GRAPH_BASE}/${id}`, { method: "POST", body: params });
+    const json: any = await res.json();
+    if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
+    return reply.send({ status: 1, message: "Ad set updated" });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Failed to update ad set" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Custom Audiences — sync CRM lead segments to Meta for retargeting/exclusion
+// ─────────────────────────────────────────────────────────────────────────────
+export const listCustomAudiences = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+  const acct = await getActiveAccount(username);
+  if (!acct?.ad_account_id) return reply.send({ status: 1, data: [] });
+
+  try {
+    const res = await fetch(
+      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/customaudiences?fields=id,name,description,approximate_count_lower_bound,delivery_status,time_updated&limit=50&access_token=${encodeURIComponent(acct.access_token)}`
+    );
+    const json: any = await res.json();
+    if (json.error) return reply.send({ status: 1, data: [], error: json.error.message });
+    return reply.send({ status: 1, data: json.data ?? [] });
+  } catch {
+    return reply.send({ status: 1, data: [], error: "Failed to list audiences" });
+  }
+};
+
+const sha256 = (v: string) => crypto.createHash("sha256").update(v.trim().toLowerCase()).digest("hex");
+
+export const createCustomAudience = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+  const acct = await getActiveAccount(username);
+  if (!acct?.ad_account_id) return reply.status(400).send({ status: 0, message: "No ad account linked" });
+
+  const { name, description, segment } = req.body as { name?: string; description?: string; segment?: string };
+  if (!name?.trim()) return reply.status(400).send({ status: 0, message: "name required" });
+
+  // Pick the CRM leads for the chosen segment
+  let q = (db as any)
+    .selectFrom("leads")
+    .select(["email", "phone"])
+    .where("username", "=", username)
+    .where("is_archived", "=", 0);
+  if (segment === "converted")  q = q.where("is_converted", "=", 1);
+  if (segment === "meta")       q = q.where("source", "=", "meta");
+  if (segment === "unconverted") q = q.where("is_converted", "=", 0);
+  const leads: any[] = await q.execute();
+
+  const rows = leads
+    .map((l) => [l.email ? sha256(l.email) : "", l.phone ? sha256(l.phone) : ""])
+    .filter(([e, p]) => e || p);
+
+  if (!rows.length) return reply.status(400).send({ status: 0, message: "No leads with email/phone in this segment" });
+
+  try {
+    // 1. Create the audience
+    const c = await fetch(`${META_GRAPH_BASE}/act_${acct.ad_account_id}/customaudiences`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        name: name.trim(),
+        subtype: "CUSTOM",
+        description: description ?? `LeadCRM segment: ${segment ?? "all"}`,
+        customer_file_source: "USER_PROVIDED_ONLY",
+        access_token: acct.access_token,
+      }),
+    });
+    const audience: any = await c.json();
+    if (audience.error) return reply.status(400).send({ status: 0, message: audience.error.message });
+
+    // 2. Upload hashed members in batches of 500
+    let uploaded = 0;
+    for (let i = 0; i < rows.length; i += 500) {
+      const batch = rows.slice(i, i + 500);
+      const u = await fetch(`${META_GRAPH_BASE}/${audience.id}/users`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          payload: JSON.stringify({ schema: ["EMAIL_SHA256", "PHONE_SHA256"], data: batch }),
+          access_token: acct.access_token,
+        }),
+      });
+      const uj: any = await u.json();
+      if (!uj.error) uploaded += batch.length;
+    }
+
+    return reply.send({
+      status: 1,
+      message: `Audience created — ${uploaded} of ${rows.length} contacts uploaded (Meta matches them over ~1h)`,
+      data: { audience_id: audience.id, uploaded, total: rows.length },
+    });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Audience creation failed" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/campaign-roi — leads/converted/revenue per campaign from CRM
+// ─────────────────────────────────────────────────────────────────────────────
+export const getCampaignRoi = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const rows: any[] = await (db as any)
+    .selectFrom("leads")
+    .select((eb: any) => [
+      "meta_campaign_id",
+      eb.fn.count("id").as("leads"),
+      eb.fn.sum("is_converted").as("converted"),
+      eb.fn.sum(eb.case().when("is_converted", "=", 1).then(eb.ref("lead_value")).else(0).end()).as("revenue"),
+    ])
+    .where("username", "=", username)
+    .where("source", "=", "meta")
+    .where("meta_campaign_id", "is not", null)
+    .groupBy("meta_campaign_id")
+    .execute();
+
+  const data = rows.map((r) => ({
+    campaign_id: r.meta_campaign_id,
+    leads:       Number(r.leads ?? 0),
+    converted:   Number(r.converted ?? 0),
+    revenue:     Number(r.revenue ?? 0),
+  }));
+
+  return reply.send({ status: 1, data });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/meta/capi/lead-event — manual CAPI trigger (also fires
+// automatically on lead status change via updateLead controller)
+// ─────────────────────────────────────────────────────────────────────────────
+export const capiLeadEvent = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const { lead_id, status } = req.body as { lead_id?: number; status?: string };
+  if (!lead_id || !status) return reply.status(400).send({ status: 0, message: "lead_id and status required" });
+
+  const result = await sendMetaCapiLeadEvent(username, Number(lead_id), status);
+  return reply.send({ status: result.sent ? 1 : 0, message: result.sent ? "CAPI event sent" : (result.reason ?? "Not sent") });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/meta/lead-forms/:formId/status — ACTIVE ⇄ ARCHIVED
+// POST /api/meta/lead-forms/:formId/duplicate — copy a form (Meta forms are
+// immutable after creation, so duplicate-and-edit is the supported "edit")
+// ─────────────────────────────────────────────────────────────────────────────
+export const updateFormStatus = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+  const acct = await getActiveAccount(username);
+  if (!acct?.page_id) return reply.status(400).send({ status: 0, message: "No Meta page connected" });
+
+  const { formId } = req.params as { formId: string };
+  const { status } = req.body as { status?: string };
+  if (!status || !["ACTIVE", "ARCHIVED"].includes(status)) {
+    return reply.status(400).send({ status: 0, message: "status must be ACTIVE or ARCHIVED" });
+  }
+
+  try {
+    const pageToken = await getPageToken(acct.access_token, acct.page_id);
+    const res = await fetch(`${META_GRAPH_BASE}/${encodeURIComponent(formId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ status, access_token: pageToken }),
+    });
+    const json: any = await res.json();
+    if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
+
+    await (db as any)
+      .updateTable("meta_lead_forms_cache")
+      .set({ status, synced_at: new Date() })
+      .where("username", "=", username)
+      .where("form_id", "=", String(formId))
+      .execute()
+      .catch(() => {});
+
+    return reply.send({ status: 1, message: `Form ${status === "ARCHIVED" ? "archived" : "activated"}` });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Failed to update form status" });
+  }
+};
+
+export const duplicateLeadForm = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+  const acct = await getActiveAccount(username);
+  if (!acct?.page_id) return reply.status(400).send({ status: 0, message: "No Meta page connected" });
+
+  const { formId } = req.params as { formId: string };
+
+  try {
+    const pageToken = await getPageToken(acct.access_token, acct.page_id);
+
+    // Fetch the source form's full definition
+    const src = await fetch(
+      `${META_GRAPH_BASE}/${encodeURIComponent(formId)}?fields=name,questions{key,label,type,options},privacy_policy_url,thank_you_page,context_card{title,content,style}&access_token=${pageToken}`
+    );
+    const form: any = await src.json();
+    if (form.error) return reply.status(400).send({ status: 0, message: form.error.message });
+
+    const payload: any = {
+      name: `${form.name} (Copy ${new Date().toISOString().slice(0, 10)})`,
+      questions: (form.questions ?? []).map((q: any) => ({
+        type: q.type,
+        ...(q.type === "CUSTOM" ? { label: q.label } : {}),
+        ...(q.options?.length ? { options: q.options.map((o: any) => ({ value: o.value ?? o })) } : {}),
+      })),
+      ...(form.privacy_policy_url ? { privacy_policy: { url: form.privacy_policy_url } } : {}),
+      ...(form.thank_you_page ? { thank_you_page: form.thank_you_page } : {}),
+      ...(form.context_card ? { context_card: form.context_card } : {}),
+    };
+
+    const res = await fetch(`${META_GRAPH_BASE}/${acct.page_id}/leadgen_forms?access_token=${pageToken}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const json: any = await res.json();
+    if (json.error) return reply.status(400).send({ status: 0, message: json.error.message });
+
+    return reply.send({ status: 1, message: "Form duplicated — sync to see it in the list", data: json });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Failed to duplicate form" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-account: GET /api/meta/accounts (all rows for client)
+//                POST /api/meta/accounts/:id/activate (switch active account)
+// ─────────────────────────────────────────────────────────────────────────────
+export const listMetaAccounts = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const rows: any[] = await (db as any)
+    .selectFrom("meta_accounts")
+    .select(["id", "page_id", "page_name", "ad_account_id", "instagram_account_id", "status", "updated_at"])
+    .where("username", "=", username)
+    .orderBy("id", "desc")
+    .execute();
+
+  return reply.send({ status: 1, data: rows });
+};
+
+export const activateMetaAccount = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const { id } = req.params as { id: string };
+  const target: any = await (db as any)
+    .selectFrom("meta_accounts")
+    .select(["id"])
+    .where("username", "=", username)
+    .where("id", "=", Number(id))
+    .executeTakeFirst();
+  if (!target) return reply.status(404).send({ status: 0, message: "Account not found" });
+
+  // One active account at a time — all reads go through getActiveAccount
+  await (db as any).updateTable("meta_accounts").set({ status: "inactive", updated_at: new Date() }).where("username", "=", username).execute();
+  await (db as any).updateTable("meta_accounts").set({ status: "active",   updated_at: new Date() }).where("id", "=", Number(id)).execute();
+
+  return reply.send({ status: 1, message: "Account switched" });
 };
