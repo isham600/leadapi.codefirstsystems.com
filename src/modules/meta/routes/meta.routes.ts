@@ -20,6 +20,8 @@ import {
   getInsightsByCampaign,
   getAdAccountInfo,
   getTokenHealth,
+  getProfile,
+  syncProfile,
   getCampaigns,
   createCampaign,
   updateCampaignStatus,
@@ -92,6 +94,9 @@ export default async function metaRoutes(fastify: FastifyInstance) {
   fastify.get("/insights-by-campaign", { preHandler: verifyJwt }, getInsightsByCampaign);
   fastify.get("/ad-account-info",     { preHandler: verifyJwt }, getAdAccountInfo);
   fastify.get("/token-health",        { preHandler: verifyJwt }, getTokenHealth);
+  // Cached profile (page + IG + ad account + token health) — Overview uses this
+  fastify.get("/profile",        { preHandler: verifyJwt }, getProfile);
+  fastify.post("/sync-profile",  { preHandler: verifyJwt }, syncProfile);
 
   // Background sync — cache (lead forms list + campaigns)
   fastify.post("/sync",       { preHandler: verifyJwt }, syncMetaData);

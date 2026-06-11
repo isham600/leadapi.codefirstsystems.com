@@ -182,6 +182,42 @@ async function syncFormLeadsToLeadManager(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Token health refresh — merged into the profile cache on every auto tick
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function refreshTokenHealth(acct: any): Promise<void> {
+  const appId     = acct.app_id     ?? process.env.META_APP_ID;
+  const appSecret = acct.app_secret ?? process.env.META_APP_SECRET;
+  if (!appId || !appSecret || !acct.access_token) return;
+
+  const res = await fetch(
+    `${META_GRAPH}/debug_token?input_token=${encodeURIComponent(acct.access_token)}&access_token=${encodeURIComponent(`${appId}|${appSecret}`)}`
+  );
+  const json: any = await res.json();
+  const d = json?.data;
+  if (!d) return;
+
+  const expiresAt = d.expires_at ? new Date(d.expires_at * 1000) : null;
+  const tokenHealth = {
+    is_valid:   !!d.is_valid,
+    expires_at: expiresAt,
+    days_left:  expiresAt ? Math.floor((expiresAt.getTime() - Date.now()) / 86_400_000) : null,
+    scopes:     d.scopes ?? [],
+    type:       d.type ?? null,
+  };
+
+  let cache: Record<string, any> = {};
+  try { cache = acct.profile_cache ? JSON.parse(acct.profile_cache) : {}; } catch { cache = {}; }
+  cache.token_health = tokenHealth;
+
+  await (db as any)
+    .updateTable("meta_accounts")
+    .set({ profile_cache: JSON.stringify(cache) })
+    .where("id", "=", acct.id)
+    .execute();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Job processor
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -193,7 +229,7 @@ async function processJob(job: Job<MetaSyncJobData>): Promise<{ forms: number; c
   if (syncType === "auto") {
     const accounts: any[] = await (db as any)
       .selectFrom("meta_accounts")
-      .select(["id", "username", "page_id", "ad_account_id", "access_token"])
+      .select(["id", "username", "page_id", "ad_account_id", "access_token", "app_id", "app_secret", "profile_cache"])
       .where("status", "=", "active")
       .execute();
 
@@ -209,6 +245,11 @@ async function processJob(job: Job<MetaSyncJobData>): Promise<{ forms: number; c
         },
         { priority: 5 } // lower priority than user-triggered syncs
       );
+
+      // Token health is the one profile field that must stay live — refresh it
+      // into the profile cache every tick so an expired token surfaces within
+      // 30 min instead of hiding behind the 24h profile TTL
+      await refreshTokenHealth(acct).catch(() => {});
     }
     console.log(`[metaSync] auto tick — queued cache sync for ${accounts.length} account(s)`);
     return { forms: 0, campaigns: 0, leads: 0 };

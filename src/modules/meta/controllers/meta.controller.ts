@@ -2123,6 +2123,149 @@ export const getAdAccountInfo = async (req: FastifyRequest, reply: FastifyReply)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Profile cache — Overview data served from DB instead of hitting the Graph
+// API on every visit. {page, instagram, ad_account, token_health} stored as
+// JSON on the meta_accounts row; refreshed when stale or via POST /sync-profile.
+// ─────────────────────────────────────────────────────────────────────────────
+const PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24h — profile data rarely changes
+
+async function fetchFullProfile(acct: any): Promise<Record<string, any>> {
+  const pageToken = acct.page_id ? await getPageToken(acct.access_token, acct.page_id) : acct.access_token;
+
+  const [page, instagram, adAccount, tokenHealth] = await Promise.all([
+    // Page info
+    (async () => {
+      if (!acct.page_id) return null;
+      try {
+        const r = await fetch(`${META_GRAPH_BASE}/${acct.page_id}?fields=name,fan_count,link,category,picture&access_token=${pageToken}`);
+        const j: any = await r.json();
+        return j.error ? null : j;
+      } catch { return null; }
+    })(),
+    // Instagram (page-linked first, direct ID fallback)
+    (async () => {
+      if (acct.page_id) {
+        try {
+          const r = await fetch(`${META_GRAPH_BASE}/${acct.page_id}?fields=instagram_business_account{name,username,followers_count,media_count,profile_picture_url,biography,website}&access_token=${pageToken}`);
+          const j: any = await r.json();
+          if (j?.instagram_business_account && !j.instagram_business_account.error) return j.instagram_business_account;
+        } catch { /* fall through */ }
+      }
+      if (acct.instagram_account_id) {
+        try {
+          const r = await fetch(`${META_GRAPH_BASE}/${acct.instagram_account_id}?fields=name,username,followers_count,media_count,profile_picture_url,biography&access_token=${pageToken}`);
+          const j: any = await r.json();
+          if (!j.error) return j;
+        } catch { /* ignore */ }
+      }
+      return null;
+    })(),
+    // Ad account
+    (async () => {
+      if (!acct.ad_account_id) return null;
+      try {
+        const r = await fetch(`${META_GRAPH_BASE}/act_${acct.ad_account_id}?fields=name,currency,account_status,amount_spent,spend_cap,timezone_name&access_token=${acct.access_token}`);
+        const j: any = await r.json();
+        if (j.error) return null;
+        return {
+          id: acct.ad_account_id,
+          name: j.name ?? null,
+          currency: j.currency ?? null,
+          account_status: AD_ACCOUNT_STATUS[j.account_status] ?? String(j.account_status ?? ""),
+          amount_spent: j.amount_spent ?? null,
+          spend_cap: j.spend_cap ?? null,
+          timezone_name: j.timezone_name ?? null,
+        };
+      } catch { return null; }
+    })(),
+    // Token health
+    (async () => {
+      const appId     = acct.app_id     ?? process.env.META_APP_ID;
+      const appSecret = acct.app_secret ?? process.env.META_APP_SECRET;
+      if (!appId || !appSecret) return null;
+      try {
+        const r = await fetch(`${META_GRAPH_BASE}/debug_token?input_token=${encodeURIComponent(acct.access_token)}&access_token=${encodeURIComponent(`${appId}|${appSecret}`)}`);
+        const j: any = await r.json();
+        const d = j?.data;
+        if (!d) return null;
+        const expiresAt = d.expires_at ? new Date(d.expires_at * 1000) : null;
+        return {
+          is_valid:   !!d.is_valid,
+          expires_at: expiresAt,
+          days_left:  expiresAt ? Math.floor((expiresAt.getTime() - Date.now()) / 86_400_000) : null,
+          scopes:     d.scopes ?? [],
+          type:       d.type ?? null,
+        };
+      } catch { return null; }
+    })(),
+  ]);
+
+  return { page, instagram, ad_account: adAccount, token_health: tokenHealth };
+}
+
+async function refreshProfileCache(acct: any): Promise<{ profile: Record<string, any>; synced_at: Date }> {
+  const profile = await fetchFullProfile(acct);
+  const synced_at = new Date();
+  await (db as any)
+    .updateTable("meta_accounts")
+    .set({ profile_cache: JSON.stringify(profile), profile_synced_at: synced_at })
+    .where("id", "=", acct.id)
+    .execute()
+    .catch(() => {});
+  return { profile, synced_at };
+}
+
+// GET /api/meta/profile — cache-first: DB → live fetch only when missing/stale
+export const getProfile = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct) return reply.send({ status: 1, data: null });
+
+  const syncedAt = acct.profile_synced_at ? new Date(acct.profile_synced_at) : null;
+  const isFresh  = syncedAt && Date.now() - syncedAt.getTime() < PROFILE_TTL_MS;
+
+  if (acct.profile_cache && isFresh) {
+    try {
+      return reply.send({
+        status: 1,
+        data: { ...JSON.parse(acct.profile_cache), synced_at: syncedAt, from_cache: true },
+      });
+    } catch { /* corrupt cache — fall through to live fetch */ }
+  }
+
+  // Missing or stale → fetch live and store; keep stale cache as fallback
+  try {
+    const { profile, synced_at } = await refreshProfileCache(acct);
+    return reply.send({ status: 1, data: { ...profile, synced_at, from_cache: false } });
+  } catch {
+    if (acct.profile_cache) {
+      try {
+        return reply.send({ status: 1, data: { ...JSON.parse(acct.profile_cache), synced_at: syncedAt, from_cache: true, stale: true } });
+      } catch { /* ignore */ }
+    }
+    return reply.send({ status: 1, data: null, error: "Failed to load profile" });
+  }
+};
+
+// POST /api/meta/sync-profile — force refresh (the "Sync Profile" button)
+export const syncProfile = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct) return reply.status(400).send({ status: 0, message: "No Meta account" });
+
+  try {
+    const { profile, synced_at } = await refreshProfileCache(acct);
+    return reply.send({ status: 1, message: "Profile synced", data: { ...profile, synced_at, from_cache: false } });
+  } catch {
+    return reply.status(500).send({ status: 0, message: "Profile sync failed" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/meta/lead-forms/:formId/questions — question keys for field mapping
 // ─────────────────────────────────────────────────────────────────────────────
 export const getFormQuestions = async (req: FastifyRequest, reply: FastifyReply) => {
