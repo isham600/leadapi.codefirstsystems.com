@@ -46,6 +46,19 @@ export interface CommunicationData {
       direction: string;
     }>;
   };
+  rcs: {
+    total_sent: number;
+    delivered: number;
+    read: number;
+    failed: number;
+    recent_messages: Array<{
+      id: number;
+      message: string;
+      status: string;
+      created_at: string;
+      direction: string;
+    }>;
+  };
 }
 
 export const getLeadCommunication = async (
@@ -76,6 +89,16 @@ export const getLeadCommunication = async (
         status: 0, statuscode: 404, message: "Lead not found",
         error: "lead_not_found", data: null, validation: null,
       });
+    }
+
+    // Resolve owning account (agents' channel data lives under the parent)
+    const userType = (req.user as any)?.user_type as number | undefined;
+    let accountUsername = username;
+    if (userType === 5) {
+      const parent: any = await (db as any)
+        .selectFrom("users").select(["parent_username"])
+        .where("username", "=", username).executeTakeFirst();
+      accountUsername = parent?.parent_username ?? username;
     }
 
     const page = parseInt(req.query.page || "1", 10);
@@ -269,13 +292,64 @@ export const getLeadCommunication = async (
       })),
     };
 
-    const totalMessages = whatsappData.total_messages + emailData.total_sent + smsData.total_sent;
+    // Get RCS communication data (matched by recipient phone, account-scoped)
+    let rcsData = {
+      total_sent: 0, delivered: 0, read: 0, failed: 0,
+      recent_messages: [] as Array<{ id: number; message: string; status: string; created_at: string; direction: string }>,
+    };
+    // RCS recipients are stored with country code, like WhatsApp
+    const rcsPhones = [phoneNumber, lead.phone].filter(Boolean) as string[];
+    if (rcsPhones.length) {
+      const rcsMessages = await (db as any)
+        .selectFrom("rcs_camp_details")
+        .leftJoin("rcs_camp_summary", "rcs_camp_summary.id", "rcs_camp_details.camp_id")
+        .select([
+          "rcs_camp_details.id as id",
+          "rcs_camp_details.status as status",
+          "rcs_camp_details.created_at as created_at",
+          "rcs_camp_summary.name as campaign_name",
+          "rcs_camp_summary.template_name as template_name",
+        ])
+        .where("rcs_camp_details.username", "=", accountUsername)
+        .where("rcs_camp_details.phone_number", "in", rcsPhones)
+        .orderBy("rcs_camp_details.created_at", "desc")
+        .limit(limit)
+        .offset(offset)
+        .execute()
+        .catch(() => [] as any[]);
+
+      const rcsTotal = await (db as any)
+        .selectFrom("rcs_camp_details")
+        .select((eb: any) => eb.fn.countAll().as("total"))
+        .where("username", "=", accountUsername)
+        .where("phone_number", "in", rcsPhones)
+        .executeTakeFirst()
+        .catch(() => ({ total: 0 }));
+
+      const norm = (s: string) => (s || "").toLowerCase();
+      rcsData = {
+        total_sent: Number(rcsTotal?.total || 0),
+        delivered: rcsMessages.filter((m: any) => norm(m.status) === "delivered").length,
+        read:      rcsMessages.filter((m: any) => norm(m.status) === "read").length,
+        failed:    rcsMessages.filter((m: any) => norm(m.status) === "failed").length,
+        recent_messages: rcsMessages.map((m: any) => ({
+          id: m.id || 0,
+          message: `RCS: ${m.campaign_name || m.template_name || "Rich message"}`,
+          status: m.status || "pending",
+          created_at: m.created_at ? new Date(m.created_at).toISOString() : "",
+          direction: "outbound",
+        })),
+      };
+    }
+
+    const totalMessages = whatsappData.total_messages + emailData.total_sent + smsData.total_sent + rcsData.total_sent;
     const totalPages = Math.ceil(totalMessages / limit);
 
     const communicationData: CommunicationData = {
       whatsapp: whatsappData,
       email: emailData,
       sms: smsData,
+      rcs: rcsData,
     };
 
     return reply.status(200).send({

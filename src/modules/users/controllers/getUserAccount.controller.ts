@@ -823,11 +823,20 @@ export const updateUserClientManagement = async (
     } = parse.data;
 
     // Check user exists
-    const existingUser = await db
+    // 🔐 Ownership: super-admin may edit anyone; others only users they created
+    let existingUserQuery = db
       .selectFrom("users")
       .select(["id", "username", "user_type"])
-      .where("id", "=", id)
-      .executeTakeFirst();
+      .where("id", "=", id);
+    if (currentUser.user_type !== 1) {
+      existingUserQuery = existingUserQuery.where((eb) =>
+        eb.or([
+          eb("parent_username", "=", parentUsername),
+          eb("parent_username", "=", currentUser.username),
+        ]),
+      );
+    }
+    const existingUser = await existingUserQuery.executeTakeFirst();
 
     if (!existingUser) {
       return reply.status(404).send({
@@ -1120,12 +1129,41 @@ export const updateUserRoleClientManagement = async (
 
     const userType = ROLE_MAP[role];
 
-    // 🔍 Check user exists
-    const user = await db
+    // 🔐 Resolve the caller (need their user_type + email for scoping)
+    let currentUser = await db
+      .selectFrom("users")
+      .select(["user_type", "username", "email"])
+      .where("username", "=", parentUsername)
+      .executeTakeFirst();
+    if (!currentUser) {
+      currentUser = await db
+        .selectFrom("users")
+        .select(["user_type", "username", "email"])
+        .where("email", "=", parentUsername)
+        .executeTakeFirst();
+    }
+    if (!currentUser) {
+      return reply.status(401).send({
+        status: 0, statuscode: 401, message: "Current user not found", error: "user_not_found",
+      });
+    }
+
+    // 🔐 Ownership: only super-admin may touch anyone; everyone else only the
+    // users they created (parent_username = them). Prevents cross-tenant edits.
+    let userQuery = db
       .selectFrom("users")
       .select(["id", "username"])
-      .where("id", "=", Number(id))
-      .executeTakeFirst();
+      .where("id", "=", Number(id));
+    if (currentUser.user_type !== 1) {
+      userQuery = userQuery.where((eb) =>
+        eb.or([
+          eb("parent_username", "=", parentUsername),
+          eb("parent_username", "=", currentUser!.username),
+          eb("parent_username", "=", currentUser!.email || ""),
+        ]),
+      );
+    }
+    const user = await userQuery.executeTakeFirst();
 
     if (!user) {
       return reply.status(404).send({
@@ -1133,6 +1171,20 @@ export const updateUserRoleClientManagement = async (
         statuscode: 404,
         message: "User not found",
         error: "not_found",
+      });
+    }
+
+    // 🔐 Role hierarchy: caller can only assign roles they're allowed to create.
+    // Without this, any caller could promote a user to super-admin (escalation).
+    const parentPermissions = await getAllPermissions(currentUser.username);
+    const canCreateResellerBool = parentPermissions?.can_create_reseller === 1;
+    const allowedUserTypes = getAllowedUserTypes(currentUser.user_type, canCreateResellerBool);
+    if (!allowedUserTypes.includes(userType)) {
+      return reply.status(403).send({
+        status: 0,
+        statuscode: 403,
+        message: `You don't have permission to assign the ${role} role`,
+        error: "permission_denied",
       });
     }
 
@@ -1316,15 +1368,8 @@ export const toggleUserStatus = async (
 ) => {
   try {
     const admin = req.user;
-    console.log("admin", admin);
-
-    // if (!admin || admin.user_type !== "admin") {
-    //   return reply.status(403).send({
-    //     status: 0,
-    //     statuscode: 403,
-    //     message: "Only admin can update user status",
-    //   });
-    // }
+    // Authorization is enforced below by scoping the target user to the
+    // caller's hierarchy (parent_username match).
 
     const { id } = req.params as { id: string };
     const { status } = req.body as { status: "enable" | "disable" };

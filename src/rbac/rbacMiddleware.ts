@@ -28,19 +28,23 @@ export const rbacCreateUser =
 
     const creatorRole = actor.user_type as ROLE;
 
-    // 🔥 FIX HERE
-    const roleString = (req.body as any).role;
-    const targetRole = ROLE_MAP[roleString ?? "user"];
+    // Only validate the role when one is actually being assigned. Update
+    // routes legitimately omit `role`; the controller handles those.
+    const roleString = (req.body as any)?.role;
+    if (roleString == null || roleString === "") return;
 
+    const targetRole = ROLE_MAP[roleString];
     if (!targetRole) {
       return reply.status(400).send({
         message: "Invalid role",
       });
     }
 
-    // if (!canCreateRole(creatorRole, targetRole)) {
-    //   return reply.status(403).send({
-    //     message: "You are not allowed to create this role",
-    //   });
-    // }
+    // Defense-in-depth: block role escalation at the route layer too.
+    // (Controllers also enforce this, but the guard must not be bypassable.)
+    if (!canCreateRole(creatorRole, targetRole)) {
+      return reply.status(403).send({
+        message: "You are not allowed to assign this role",
+      });
+    }
   };

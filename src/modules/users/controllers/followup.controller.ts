@@ -498,22 +498,95 @@ export const getLeadActivities = async (
     const limit = parseInt(req.query.limit || "100", 10);
     const offset = (page - 1) * limit;
 
-    const countResult = await db
-      .selectFrom("lead_activities")
-      .select((eb) => eb.fn.countAll().as("total"))
-      .where("lead_id", "=", leadId)
-      .executeTakeFirst();
+    // ── Unified timeline: lead_activities + WhatsApp chats + phone calls ──────
+    // The lead_activities table only logs notes/stage/status/follow-ups/email,
+    // so WhatsApp and call history were invisible. Merge them here (bounded
+    // per-lead) so the timeline reflects the full history.
+    const userType = (req.user as any)?.user_type as number | undefined;
+    let accountUsername = username;
+    if (userType === 5) {
+      const parent: any = await (db as any)
+        .selectFrom("users").select(["parent_username"])
+        .where("username", "=", username).executeTakeFirst();
+      accountUsername = parent?.parent_username ?? username;
+    }
 
-    const total = Number(countResult?.total || 0);
+    const leadRow: any = await (db as any)
+      .selectFrom("leads").select(["phone", "country_code"])
+      .where("id", "=", leadId).executeTakeFirst();
+    const phone = leadRow?.phone ? String(leadRow.phone) : null;
+    const phoneVariants = phone
+      ? Array.from(new Set([phone, `${leadRow.country_code ?? ""}${phone}`.replace(/^\+/, "")]))
+      : [];
 
-    const activities = await db
+    // 1) Base activities (notes, stage/status, follow-ups, email, forms)
+    const baseActivities: any[] = await db
       .selectFrom("lead_activities")
       .selectAll()
       .where("lead_id", "=", leadId)
-      .orderBy("created_at", "desc")
-      .limit(limit)
-      .offset(offset)
       .execute();
+
+    // 2) WhatsApp messages (chat_messages matched by phone, account-scoped)
+    let waActivities: any[] = [];
+    if (phoneVariants.length) {
+      const waRows: any[] = await (db as any)
+        .selectFrom("chat_messages")
+        .select(["id", "text", "type", "direction", "status", "created_at"])
+        .where("username", "=", accountUsername)
+        .where((eb: any) => eb.or([
+          eb("sender_id", "in", phoneVariants),
+          eb("receiver_id", "in", phoneVariants),
+        ]))
+        .orderBy("created_at", "desc")
+        .limit(500)
+        .execute()
+        .catch(() => []);
+      waActivities = waRows.map((m) => ({
+        id: `wa_${m.id}`,
+        lead_id: leadId,
+        login_username: null,
+        activity_type: "WHATSAPP",
+        action: m.direction === "inbound" ? "WHATSAPP_RECEIVED" : "WHATSAPP_SENT",
+        direction: m.direction,
+        status: m.status,
+        description: m.text || (m.type && m.type !== "text" ? `[${m.type}]` : "WhatsApp message"),
+        duration_seconds: null,
+        metadata: null,
+        created_at: m.created_at,
+      }));
+    }
+
+    // 3) Calls (phone_ivr_calls by lead_id, account-scoped)
+    const callRows: any[] = await (db as any)
+      .selectFrom("phone_ivr_calls")
+      .select(["id", "direction", "status", "duration_sec", "recording_url", "agent_username", "created_at"])
+      .where("username", "=", accountUsername)
+      .where("lead_id", "=", leadId)
+      .orderBy("created_at", "desc")
+      .limit(500)
+      .execute()
+      .catch(() => []);
+    const callActivities: any[] = callRows.map((c) => ({
+      id: `call_${c.id}`,
+      lead_id: leadId,
+      login_username: c.agent_username || null,
+      activity_type: "CALL",
+      action: c.direction === "inbound" ? "CALL_INBOUND" : "CALL_OUTBOUND",
+      direction: c.direction,
+      status: c.status,
+      description: `${c.direction === "inbound" ? "Inbound" : "Outbound"} call${c.status ? " · " + c.status : ""}`,
+      duration_seconds: c.duration_sec ?? null,
+      metadata: c.recording_url ? JSON.stringify({ recording_url: c.recording_url }) : null,
+      created_at: c.created_at,
+    }));
+
+    // Merge + sort newest-first, then paginate the combined feed
+    const merged = [...baseActivities, ...waActivities, ...callActivities].sort(
+      (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+    );
+
+    const total = merged.length;
+    const activities = merged.slice(offset, offset + limit);
 
     // Group activities by date
     const groupedByDate: Record<string, any[]> = {};
