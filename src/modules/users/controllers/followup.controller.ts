@@ -1,5 +1,6 @@
 import { FastifyRequest, FastifyReply } from "fastify";
 import { db } from "../../../models/db.js";
+import { canAccessLead } from "../utils/leadAccess.js";
 
 // Helper function to sanitize text by removing emojis and problematic characters
 const sanitizeText = (text: string | null | undefined): string => {
@@ -49,6 +50,14 @@ export const scheduleFollowUp = async (
         error: "validation_error",
         data: null,
         validation: null,
+      });
+    }
+
+    // 🔐 ownership: the lead must belong to this user/account
+    if (!(await canAccessLead(req, Number(lead_id)))) {
+      return reply.status(404).send({
+        status: 0, statuscode: 404, message: "Lead not found",
+        error: "lead_not_found", data: null, validation: null,
       });
     }
 
@@ -171,6 +180,15 @@ export const getLeadFollowUps = async (
     }
 
     const leadId = Number(req.params.leadId);
+
+    // 🔐 ownership guard
+    if (!(await canAccessLead(req, leadId))) {
+      return reply.status(404).send({
+        status: 0, statuscode: 404, message: "Lead not found",
+        error: "lead_not_found", data: null, validation: null,
+      });
+    }
+
     const page = parseInt(req.query.page || "1", 10);
     const limit = parseInt(req.query.limit || "10", 10);
     const offset = (page - 1) * limit;
@@ -262,6 +280,14 @@ export const updateFollowUp = async (
         error: "followup_not_found",
         data: null,
         validation: null,
+      });
+    }
+
+    // 🔐 ownership: the follow-up's lead must belong to this user/account
+    if (!(await canAccessLead(req, Number(existingFollowUp.lead_id)))) {
+      return reply.status(404).send({
+        status: 0, statuscode: 404, message: "Follow-up not found",
+        error: "followup_not_found", data: null, validation: null,
       });
     }
 
@@ -459,6 +485,15 @@ export const getLeadActivities = async (
     }
 
     const leadId = Number(req.params.leadId);
+
+    // 🔐 ownership guard
+    if (!(await canAccessLead(req, leadId))) {
+      return reply.status(404).send({
+        status: 0, statuscode: 404, message: "Lead not found",
+        error: "lead_not_found", data: null, validation: null,
+      });
+    }
+
     const page = parseInt(req.query.page || "1", 10);
     const limit = parseInt(req.query.limit || "100", 10);
     const offset = (page - 1) * limit;

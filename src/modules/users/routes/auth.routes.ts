@@ -149,6 +149,11 @@ import {
   getLeadCommunication,
 } from "../controllers/communication.controller.js";
 import {
+  getLeadNotes,
+  createLeadNote,
+  deleteLeadNote,
+} from "../controllers/leadNotes.controller.js";
+import {
   createTemplate,
   getTemplates,
   getTemplate,
@@ -846,7 +851,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
   }>("/leads/:leadId/activities", { preHandler: verifyJwt }, getLeadActivities);
 
   // Get lead communication data
-  fastify.get<{ 
+  fastify.get<{
     Params: { leadId: string };
     Querystring: { page?: string; limit?: string };
   }>(
@@ -854,6 +859,11 @@ export default async function authRoutes(fastify: FastifyInstance) {
     { preHandler: verifyJwt },
     getLeadCommunication,
   );
+
+  // Lead notes (server-backed; ownership-scoped)
+  fastify.get<{ Params: { leadId: string } }>("/leads/:leadId/notes", { preHandler: verifyJwt }, getLeadNotes);
+  fastify.post<{ Params: { leadId: string }; Body: { note?: string } }>("/leads/:leadId/notes", { preHandler: verifyJwt }, createLeadNote);
+  fastify.delete<{ Params: { leadId: string; noteId: string } }>("/leads/:leadId/notes/:noteId", { preHandler: verifyJwt }, deleteLeadNote);
 
   // ───────────────────────────────────────────────────────────
   //  🔐 DASHBOARD API  ROUTES

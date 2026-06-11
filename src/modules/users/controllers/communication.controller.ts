@@ -1,5 +1,6 @@
 import { FastifyRequest, FastifyReply } from "fastify";
 import { db } from "../../../models/db.js";
+import { canAccessLead } from "../utils/leadAccess.js";
 
 export interface CommunicationData {
   whatsapp: {
@@ -68,6 +69,15 @@ export const getLeadCommunication = async (
     }
 
     const leadId = Number(req.params.leadId);
+
+    // 🔐 ownership guard — communication history is sensitive (chats, emails, SMS)
+    if (!(await canAccessLead(req, leadId))) {
+      return reply.status(404).send({
+        status: 0, statuscode: 404, message: "Lead not found",
+        error: "lead_not_found", data: null, validation: null,
+      });
+    }
+
     const page = parseInt(req.query.page || "1", 10);
     const limit = parseInt(req.query.limit || "20", 10);
     const offset = (page - 1) * limit;
