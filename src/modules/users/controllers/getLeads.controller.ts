@@ -247,125 +247,108 @@ export const getLeads = async (
     const validSortBy = sortBy && allowedSortColumns.includes(sortBy) ? sortBy : "created_at";
     const validSortOrder = sortOrder && sortOrder.toLowerCase() === "asc" ? "asc" : "desc";
 
-    // First, get all leads with the filters applied
-    let allLeads = await buildBaseQuery()
+    // ============================================================
+    // 🚀 SQL-LEVEL DEDUP + PAGINATION (was: load ALL rows + JS dedup/slice)
+    // A window function keeps the newest lead per phone (empty/NULL phone =
+    // its own group), so the DB does the work and we transfer one page only.
+    // ============================================================
+    const dedupedInner = () =>
+      buildBaseQuery()
+        .selectAll()
+        .select(
+          // CONVERT(phone) avoids a latin1/utf8mb4 collation clash in COALESCE
+          sql<number>`ROW_NUMBER() OVER (PARTITION BY COALESCE(NULLIF(CONVERT(phone USING utf8mb4), ''), CONCAT('__id_', CAST(id AS CHAR))) ORDER BY created_at DESC, id DESC)`.as("rn")
+        );
+
+    // Page of deduplicated leads
+    const pageRows: any[] = await (db as any)
+      .selectFrom(dedupedInner().as("t"))
       .selectAll()
+      .where("rn", "=", 1)
       .orderBy(validSortBy as any, validSortOrder)
+      .limit(limit)
+      .offset(offset)
       .execute();
 
-    // Deduplicate by phone number - keep only the most recent lead for each phone
-    const uniqueLeadsMap = new Map();
-    
-    for (const lead of allLeads) {
-      if (lead.phone) {
-        const existing = uniqueLeadsMap.get(lead.phone);
-        // Keep the lead with the most recent created_at timestamp
-        if (!existing || new Date(lead.created_at) > new Date(existing.created_at)) {
-          uniqueLeadsMap.set(lead.phone, lead);
-        }
-      } else {
-        // If no phone number, keep the lead (use id as unique key)
-        uniqueLeadsMap.set(`no_phone_${lead.id}`, lead);
+    // Total deduplicated groups (drives pagination)
+    const countRow: any = await (db as any)
+      .selectFrom(dedupedInner().as("t"))
+      .select((eb: any) => eb.fn.countAll().as("cnt"))
+      .where("rn", "=", 1)
+      .executeTakeFirst();
+    const deduplicatedTotal = Number(countRow?.cnt ?? 0);
+
+    // Overview KPIs over the deduplicated (filtered) set — one aggregate query
+    const ov: any = await (db as any)
+      .selectFrom(dedupedInner().as("t"))
+      .where("rn", "=", 1)
+      .select([
+        sql<number>`COUNT(*)`.as("totalLeads"),
+        sql<number>`SUM(CASE WHEN LOWER(status) = 'new' AND is_converted <> 1 THEN 1 ELSE 0 END)`.as("new"),
+        sql<number>`SUM(CASE WHEN LOWER(status) = 'contacted' AND is_converted <> 1 THEN 1 ELSE 0 END)`.as("contacted"),
+        sql<number>`SUM(CASE WHEN LOWER(status) = 'follow-up' AND is_converted <> 1 THEN 1 ELSE 0 END)`.as("followUp"),
+        sql<number>`SUM(CASE WHEN LOWER(status) = 'qualified' AND is_converted <> 1 THEN 1 ELSE 0 END)`.as("qualified"),
+        sql<number>`SUM(CASE WHEN LOWER(status) IN ('proposal / demo / visit', 'proposal sent') AND is_converted <> 1 THEN 1 ELSE 0 END)`.as("proposalDemo"),
+        sql<number>`SUM(CASE WHEN LOWER(status) = 'won / converted' OR is_converted = 1 THEN 1 ELSE 0 END)`.as("converted"),
+        sql<number>`SUM(CASE WHEN LOWER(status) = 'lost' THEN 1 ELSE 0 END)`.as("lost"),
+        sql<number>`SUM(CASE WHEN next_followup_at IS NOT NULL AND next_followup_at < NOW() THEN 1 ELSE 0 END)`.as("overdue"),
+      ])
+      .executeTakeFirst();
+
+    const overview = {
+      totalLeads:   Number(ov?.totalLeads ?? 0),
+      new:          Number(ov?.new ?? 0),
+      contacted:    Number(ov?.contacted ?? 0),
+      followUp:     Number(ov?.followUp ?? 0),
+      qualified:    Number(ov?.qualified ?? 0),
+      proposalDemo: Number(ov?.proposalDemo ?? 0),
+      converted:    Number(ov?.converted ?? 0),
+      lost:         Number(ov?.lost ?? 0),
+      overdue:      Number(ov?.overdue ?? 0),
+    };
+
+    // ============================================================
+    // 🔄 Duplicate sources for THIS page — one batched query, no writes
+    // (was: N+1 queries + an UPDATE inside this read-only GET handler)
+    // ============================================================
+    const pagePhones = Array.from(new Set(pageRows.map((l) => l.phone).filter(Boolean)));
+    const sourceRows: any[] = pagePhones.length
+      ? await db
+          .selectFrom("leads")
+          .select(["phone", "source"])
+          .where("username", "=", accountUsername)
+          .where("phone", "in", pagePhones as string[])
+          .execute()
+      : [];
+
+    const sourcesByPhone = new Map<string, Set<string>>();
+    const countByPhone   = new Map<string, number>();
+    for (const r of sourceRows) {
+      if (!r.phone) continue;
+      countByPhone.set(r.phone, (countByPhone.get(r.phone) ?? 0) + 1);
+      if (r.source) {
+        const set = sourcesByPhone.get(r.phone) ?? new Set<string>();
+        set.add(r.source);
+        sourcesByPhone.set(r.phone, set);
       }
     }
 
-    // Convert map back to array
-    const deduplicatedLeads = Array.from(uniqueLeadsMap.values());
-    
-    // Calculate total AFTER deduplication
-    const total = deduplicatedLeads.length;
-    
-    // Apply pagination to deduplicated results
-    const leads = deduplicatedLeads.slice(offset, offset + limit);
-
-    // ============================================================
-    // 🔄 CHECK AND FETCH DUPLICATE SOURCES (BY PHONE NUMBER)
-    // ============================================================
-    const leadsWithSources = await Promise.all(
-      leads.map(async (lead) => {
-        // Check if this phone number exists in multiple leads
-        if (lead.phone) {
-          const duplicateLeads = await db
-            .selectFrom("leads")
-            .select(["id", "source", "created_at"])
-            .where("username", "=", accountUsername)
-            .where("phone", "=", lead.phone)
-            .execute();
-
-          // If more than one lead with same phone, it's a duplicate
-          const isDuplicate = duplicateLeads.length > 1;
-
-          if (isDuplicate) {
-            // Get unique sources from all duplicate leads
-            const allSources = Array.from(
-              new Set(duplicateLeads.map((l) => l.source).filter(Boolean))
-            );
-
-            // Update is_duplicate flag for this lead if not already set
-            if (lead.is_duplicate !== 1) {
-              await db
-                .updateTable("leads")
-                .set({ is_duplicate: 1 })
-                .where("id", "=", lead.id)
-                .execute();
-            }
-
-            return {
-              ...lead,
-              is_duplicate: 1,
-              all_sources: allSources,
-            };
-          }
-        }
-
+    const leadsWithSources = pageRows.map((row) => {
+      const { rn, ...lead } = row; // strip the window helper column
+      const dupCount = lead.phone ? (countByPhone.get(lead.phone) ?? 0) : 0;
+      if (dupCount > 1) {
         return {
           ...lead,
-          all_sources: [lead.source],
+          is_duplicate: 1,
+          all_sources: Array.from(sourcesByPhone.get(lead.phone) ?? new Set([lead.source].filter(Boolean))),
         };
-      })
-    );
+      }
+      return { ...lead, all_sources: [lead.source].filter(Boolean) };
+    });
 
-    // Update total count to reflect deduplicated leads
-    const deduplicatedTotal = deduplicatedLeads.length;
-    const totalPages = Math.ceil(deduplicatedTotal / limit);
+    const totalPages = Math.ceil(deduplicatedTotal / limit) || 0;
     const hasNextPage = page < totalPages;
     const hasPreviousPage = page > 1;
-
-    // ============================================================
-    // 📊 CALCULATE OVERVIEW STATISTICS
-    // ============================================================
-    const overview = {
-      totalLeads: deduplicatedTotal,
-      new: deduplicatedLeads.filter(lead => 
-        lead.status?.toLowerCase() === 'new' && lead.is_converted !== 1
-      ).length,
-      contacted: deduplicatedLeads.filter(lead => 
-        lead.status?.toLowerCase() === 'contacted' && lead.is_converted !== 1
-      ).length,
-      followUp: deduplicatedLeads.filter(lead => 
-        lead.status?.toLowerCase() === 'follow-up' && lead.is_converted !== 1
-      ).length,
-      qualified: deduplicatedLeads.filter(lead => 
-        lead.status?.toLowerCase() === 'qualified' && lead.is_converted !== 1
-      ).length,
-      proposalDemo: deduplicatedLeads.filter(lead => 
-        (lead.status?.toLowerCase() === 'proposal / demo / visit' ||
-        lead.status?.toLowerCase() === 'proposal sent') && lead.is_converted !== 1
-      ).length,
-      converted: deduplicatedLeads.filter(lead => 
-        lead.status?.toLowerCase() === 'won / converted' ||
-        lead.is_converted === 1
-      ).length,
-      lost: deduplicatedLeads.filter(lead => 
-        lead.status?.toLowerCase() === 'lost'
-      ).length,
-      overdue: deduplicatedLeads.filter(lead => {
-        if (!lead.next_followup_at) return false;
-        const followupDate = new Date(lead.next_followup_at);
-        const now = new Date();
-        return followupDate < now;
-      }).length,
-    };
 
     return reply.status(200).send({
       status: 1,
@@ -440,25 +423,35 @@ export const getLeadById = async (
       });
     }
 
-    // 🔐 tenant_id comes ONLY from JWT (verifyJwt middleware)
-    const tenantId = (req.user as any)?.tenant_id;
+    // 🔐 Ownership scope — resolve the account this user can read (agents
+    // read under their parent's username, restricted to their assigned leads).
+    // Without this, any authenticated user could read ANY lead by id (IDOR).
+    const ownerUsername = req.user?.username;
+    const userType      = (req.user as any)?.user_type as number | undefined;
+    if (!ownerUsername) {
+      return reply.status(401).send({
+        status: 0, statuscode: 401, message: "Unauthorized user",
+        error: "unauthorized", data: null, validation: null,
+      });
+    }
 
-    // if (!tenantId) {
-    //   return reply.status(401).send({
-    //     status: 0,
-    //     statuscode: 401,
-    //     message: "Unauthorized",
-    //     error: "tenant_missing",
-    //     data: null,
-    //     validation: null,
-    //   });
-    // }
+    let accountUsername: string = ownerUsername;
+    let agentFilter: string | null = null;
+    if (userType === 5) {
+      const parentRow: any = await (db as any)
+        .selectFrom("users")
+        .select(["parent_username"])
+        .where("username", "=", ownerUsername)
+        .executeTakeFirst();
+      accountUsername = parentRow?.parent_username ?? ownerUsername;
+      agentFilter     = ownerUsername;
+    }
 
     // ============================================================
     // 🔍 FETCH LEAD (explicit columns → tenant_id excluded)
     // ============================================================
-    
-    const lead = await db
+
+    let leadQuery = db
       .selectFrom("leads")
       .select([
         "id",
@@ -496,8 +489,13 @@ export const getLeadById = async (
         "updated_at",
       ])
       .where("id", "=", leadId)
-      // .where("tenant_id", "=", tenantId) // 🔐 tenant isolation
-      .executeTakeFirst();
+      .where("username", "=", accountUsername); // 🔐 ownership isolation
+
+    if (agentFilter) {
+      leadQuery = leadQuery.where("assigned_agent", "=", agentFilter);
+    }
+
+    const lead = await leadQuery.executeTakeFirst();
 
     // ❌ Lead not found
     if (!lead) {

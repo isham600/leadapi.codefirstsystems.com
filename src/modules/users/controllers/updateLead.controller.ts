@@ -49,13 +49,32 @@ export const updateLead = async (
     const leadId = Number(req.params.id);
     const updateData = req.body;
 
-    // Check if lead exists
-    const existingLead = await db
+    // ── Agent hierarchy: agents (user_type=5) own no leads directly — their
+    // leads live under the parent's username and are restricted to the ones
+    // assigned to them. Without this, agents 404 on leads they can see.
+    const userType = (req.user as any)?.user_type as number | undefined;
+    let accountUsername: string = username;
+    let agentFilter: string | null = null;
+    if (userType === 5) {
+      const parentRow: any = await (db as any)
+        .selectFrom("users")
+        .select(["parent_username"])
+        .where("username", "=", username)
+        .executeTakeFirst();
+      accountUsername = parentRow?.parent_username ?? username;
+      agentFilter     = username;
+    }
+
+    // Check if lead exists (scoped to the account, and to the agent if one)
+    let existingQuery = db
       .selectFrom("leads")
       .selectAll()
       .where("id", "=", leadId)
-      .where("username", "=", username)
-      .executeTakeFirst();
+      .where("username", "=", accountUsername);
+    if (agentFilter) {
+      existingQuery = existingQuery.where("assigned_agent", "=", agentFilter);
+    }
+    const existingLead = await existingQuery.executeTakeFirst();
 
     if (!existingLead) {
       return reply.status(404).send({
@@ -94,11 +113,12 @@ export const updateLead = async (
 
     console.log("Update fields:", updateFields); // Debug log
 
-    // Update the lead
+    // Update the lead (scoped to the resolved account)
     await db
       .updateTable("leads")
       .set(updateFields)
       .where("id", "=", leadId)
+      .where("username", "=", accountUsername)
       .execute();
 
     const tenant_id = (req.user as any)?.tenant_id || null;
