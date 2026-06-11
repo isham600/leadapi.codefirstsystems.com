@@ -1491,6 +1491,17 @@ export const getFormLeads = async (req: FastifyRequest, reply: FastifyReply) => 
   }
 };
 
+// Build the Insights time filter: custom since/until (time_range) when both
+// are valid YYYY-MM-DD dates, otherwise the date_preset shorthand
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function insightsTimeParam(q: any): string {
+  const { since, until, date_preset } = q ?? {};
+  if (DATE_RE.test(since ?? "") && DATE_RE.test(until ?? "") && since <= until) {
+    return `time_range=${encodeURIComponent(JSON.stringify({ since, until }))}`;
+  }
+  return `date_preset=${encodeURIComponent(date_preset ?? "last_30d")}`;
+}
+
 // GET /api/meta/insights  — ad account performance
 // ─────────────────────────────────────────────────────────────────────────────
 export const getInsights = async (req: FastifyRequest, reply: FastifyReply) => {
@@ -1500,12 +1511,9 @@ export const getInsights = async (req: FastifyRequest, reply: FastifyReply) => {
   const acct = await getActiveAccount(username);
   if (!acct?.ad_account_id) return reply.send({ status: 1, data: null });
 
-  const q = req.query as any;
-  const preset = q.date_preset ?? "last_30d";
-
   try {
     const res = await fetch(
-      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=spend,impressions,clicks,reach,actions&date_preset=${preset}&access_token=${acct.access_token}`
+      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=spend,impressions,clicks,reach,actions&${insightsTimeParam(req.query)}&access_token=${acct.access_token}`
     );
     const json: any = await res.json();
     return reply.send({ status: 1, data: json.data?.[0] ?? null, error: json.error ?? null });
@@ -2254,12 +2262,9 @@ export const getInsightsTimeseries = async (req: FastifyRequest, reply: FastifyR
   const acct = await getActiveAccount(username);
   if (!acct?.ad_account_id) return reply.send({ status: 1, data: [] });
 
-  const q = req.query as any;
-  const preset = q.date_preset ?? "last_30d";
-
   try {
     const res = await fetch(
-      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=spend,impressions,clicks,reach,cpm,frequency,actions&date_preset=${preset}&time_increment=1&limit=500&access_token=${acct.access_token}`
+      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=spend,impressions,clicks,reach,cpm,frequency,actions&${insightsTimeParam(req.query)}&time_increment=1&limit=500&access_token=${acct.access_token}`
     );
     const json: any = await res.json();
     if (json.error) return reply.send({ status: 1, data: [], error: json.error.message });
@@ -2278,6 +2283,39 @@ export const getInsightsTimeseries = async (req: FastifyRequest, reply: FastifyR
     return reply.send({ status: 1, data: series });
   } catch {
     return reply.send({ status: 1, data: [], error: "Failed to fetch timeseries" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/meta/insights-by-campaign — live campaign-level insights for any
+// preset or custom since/until range (the sync cache is fixed at last_30d)
+// ─────────────────────────────────────────────────────────────────────────────
+export const getInsightsByCampaign = async (req: FastifyRequest, reply: FastifyReply) => {
+  const username = req.user?.username;
+  if (!username) return reply.status(401).send({ status: 0, message: "Unauthorized" });
+
+  const acct = await getActiveAccount(username);
+  if (!acct?.ad_account_id) return reply.send({ status: 1, data: [] });
+
+  try {
+    const res = await fetch(
+      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=campaign_id,campaign_name,spend,impressions,clicks,actions&level=campaign&${insightsTimeParam(req.query)}&limit=200&access_token=${acct.access_token}`
+    );
+    const json: any = await res.json();
+    if (json.error) return reply.send({ status: 1, data: [], error: json.error.message });
+
+    const data = (json.data ?? []).map((row: any) => ({
+      id:          row.campaign_id,
+      name:        row.campaign_name,
+      spend:       Number(row.spend ?? 0),
+      impressions: Number(row.impressions ?? 0),
+      clicks:      Number(row.clicks ?? 0),
+      leads:       Number((row.actions ?? []).find((a: any) => a.action_type === "lead")?.value ?? 0),
+    }));
+
+    return reply.send({ status: 1, data });
+  } catch {
+    return reply.send({ status: 1, data: [], error: "Failed to fetch campaign insights" });
   }
 };
 

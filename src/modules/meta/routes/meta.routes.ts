@@ -17,6 +17,7 @@ import {
   getFormLeads,
   getInsights,
   getInsightsTimeseries,
+  getInsightsByCampaign,
   getAdAccountInfo,
   getTokenHealth,
   getCampaigns,
@@ -86,8 +87,9 @@ export default async function metaRoutes(fastify: FastifyInstance) {
   fastify.get("/lead-forms/:formId/questions", { preHandler: verifyJwt }, getFormQuestions);
   fastify.get("/lead-forms/:formId/field-map", { preHandler: verifyJwt }, getFieldMap);
   fastify.put("/lead-forms/:formId/field-map", { preHandler: verifyJwt }, saveFieldMap);
-  fastify.get("/insights",            { preHandler: verifyJwt }, getInsights);
-  fastify.get("/insights-timeseries", { preHandler: verifyJwt }, getInsightsTimeseries);
+  fastify.get("/insights",             { preHandler: verifyJwt }, getInsights);
+  fastify.get("/insights-timeseries",  { preHandler: verifyJwt }, getInsightsTimeseries);
+  fastify.get("/insights-by-campaign", { preHandler: verifyJwt }, getInsightsByCampaign);
   fastify.get("/ad-account-info",     { preHandler: verifyJwt }, getAdAccountInfo);
   fastify.get("/token-health",        { preHandler: verifyJwt }, getTokenHealth);
 
