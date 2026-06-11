@@ -1502,6 +1502,54 @@ function insightsTimeParam(q: any): string {
   return `date_preset=${encodeURIComponent(date_preset ?? "last_30d")}`;
 }
 
+// Range part of an insights cache key, e.g. "last_30d" or "2026-05-01_2026-05-15"
+function insightsRangeKey(q: any): string {
+  const { since, until, date_preset } = q ?? {};
+  if (DATE_RE.test(since ?? "") && DATE_RE.test(until ?? "") && since <= until) return `${since}_${until}`;
+  return String(date_preset ?? "last_30d");
+}
+
+// ── Insights cache: 15-min TTL per (account, endpoint, range) ────────────────
+// Ad stats lag ~15–30 min on Meta's side anyway, so this costs no accuracy.
+// Live fetch failures fall back to the stale cached copy.
+const INSIGHTS_TTL_MS = 15 * 60 * 1000;
+
+async function withInsightsCache<T>(
+  acct: any,
+  cacheKey: string,
+  fetcher: () => Promise<T>,
+): Promise<{ data: T; from_cache: boolean; stale?: boolean }> {
+  const row: any = await (db as any)
+    .selectFrom("meta_insights_cache")
+    .select(["payload", "synced_at"])
+    .where("account_id", "=", acct.id)
+    .where("cache_key", "=", cacheKey)
+    .executeTakeFirst()
+    .catch(() => null);
+
+  const isFresh = row && Date.now() - new Date(row.synced_at).getTime() < INSIGHTS_TTL_MS;
+  if (isFresh) {
+    try { return { data: JSON.parse(row.payload), from_cache: true }; } catch { /* corrupt — refetch */ }
+  }
+
+  try {
+    const data = await fetcher();
+    await (db as any)
+      .insertInto("meta_insights_cache")
+      .values({ account_id: acct.id, username: acct.username, cache_key: cacheKey, payload: JSON.stringify(data), synced_at: new Date() })
+      .onDuplicateKeyUpdate({ payload: JSON.stringify(data), synced_at: new Date() })
+      .execute()
+      .catch(() => {});
+    return { data, from_cache: false };
+  } catch (err) {
+    // Meta unreachable / errored — serve the stale copy if we have one
+    if (row) {
+      try { return { data: JSON.parse(row.payload), from_cache: true, stale: true }; } catch { /* ignore */ }
+    }
+    throw err;
+  }
+}
+
 // GET /api/meta/insights  — ad account performance
 // ─────────────────────────────────────────────────────────────────────────────
 export const getInsights = async (req: FastifyRequest, reply: FastifyReply) => {
@@ -1512,13 +1560,17 @@ export const getInsights = async (req: FastifyRequest, reply: FastifyReply) => {
   if (!acct?.ad_account_id) return reply.send({ status: 1, data: null });
 
   try {
-    const res = await fetch(
-      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=spend,impressions,clicks,reach,actions&${insightsTimeParam(req.query)}&access_token=${acct.access_token}`
-    );
-    const json: any = await res.json();
-    return reply.send({ status: 1, data: json.data?.[0] ?? null, error: json.error ?? null });
-  } catch {
-    return reply.send({ status: 1, data: null, error: "Failed to fetch insights" });
+    const { data, from_cache, stale } = await withInsightsCache(acct, `insights:${insightsRangeKey(req.query)}`, async () => {
+      const res = await fetch(
+        `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=spend,impressions,clicks,reach,actions&${insightsTimeParam(req.query)}&access_token=${acct.access_token}`
+      );
+      const json: any = await res.json();
+      if (json.error) throw new Error(json.error.message);
+      return json.data?.[0] ?? null;
+    });
+    return reply.send({ status: 1, data, from_cache, stale: stale ?? false });
+  } catch (err: any) {
+    return reply.send({ status: 1, data: null, error: err?.message ?? "Failed to fetch insights" });
   }
 };
 
@@ -2277,6 +2329,21 @@ export const getFormQuestions = async (req: FastifyRequest, reply: FastifyReply)
 
   const { formId } = req.params as { formId: string };
 
+  // Meta forms are immutable after creation — questions cache never expires
+  const cached: any = await (db as any)
+    .selectFrom("meta_lead_forms_cache")
+    .select(["questions_cache"])
+    .where("username", "=", username)
+    .where("form_id", "=", String(formId))
+    .executeTakeFirst()
+    .catch(() => null);
+
+  if (cached?.questions_cache) {
+    try {
+      return reply.send({ status: 1, data: JSON.parse(cached.questions_cache), from_cache: true });
+    } catch { /* corrupt — refetch */ }
+  }
+
   try {
     const pageToken = await getPageToken(acct.access_token, acct.page_id);
     const res = await fetch(
@@ -2290,7 +2357,17 @@ export const getFormQuestions = async (req: FastifyRequest, reply: FastifyReply)
       label: q.label ?? q.key ?? "",
       type:  q.type ?? "CUSTOM",
     }));
-    return reply.send({ status: 1, data: questions });
+
+    // Store for next time (best effort — row may not exist until first sync)
+    await (db as any)
+      .updateTable("meta_lead_forms_cache")
+      .set({ questions_cache: JSON.stringify(questions) })
+      .where("username", "=", username)
+      .where("form_id", "=", String(formId))
+      .execute()
+      .catch(() => {});
+
+    return reply.send({ status: 1, data: questions, from_cache: false });
   } catch {
     return reply.status(500).send({ status: 0, message: "Failed to fetch form questions" });
   }
@@ -2406,26 +2483,26 @@ export const getInsightsTimeseries = async (req: FastifyRequest, reply: FastifyR
   if (!acct?.ad_account_id) return reply.send({ status: 1, data: [] });
 
   try {
-    const res = await fetch(
-      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=spend,impressions,clicks,reach,cpm,frequency,actions&${insightsTimeParam(req.query)}&time_increment=1&limit=500&access_token=${acct.access_token}`
-    );
-    const json: any = await res.json();
-    if (json.error) return reply.send({ status: 1, data: [], error: json.error.message });
-
-    const series = (json.data ?? []).map((row: any) => ({
-      date:        row.date_start,
-      spend:       Number(row.spend ?? 0),
-      impressions: Number(row.impressions ?? 0),
-      clicks:      Number(row.clicks ?? 0),
-      reach:       Number(row.reach ?? 0),
-      cpm:         Number(row.cpm ?? 0),
-      frequency:   Number(row.frequency ?? 0),
-      leads:       Number((row.actions ?? []).find((a: any) => a.action_type === "lead")?.value ?? 0),
-    }));
-
-    return reply.send({ status: 1, data: series });
-  } catch {
-    return reply.send({ status: 1, data: [], error: "Failed to fetch timeseries" });
+    const { data, from_cache, stale } = await withInsightsCache(acct, `timeseries:${insightsRangeKey(req.query)}`, async () => {
+      const res = await fetch(
+        `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=spend,impressions,clicks,reach,cpm,frequency,actions&${insightsTimeParam(req.query)}&time_increment=1&limit=500&access_token=${acct.access_token}`
+      );
+      const json: any = await res.json();
+      if (json.error) throw new Error(json.error.message);
+      return (json.data ?? []).map((row: any) => ({
+        date:        row.date_start,
+        spend:       Number(row.spend ?? 0),
+        impressions: Number(row.impressions ?? 0),
+        clicks:      Number(row.clicks ?? 0),
+        reach:       Number(row.reach ?? 0),
+        cpm:         Number(row.cpm ?? 0),
+        frequency:   Number(row.frequency ?? 0),
+        leads:       Number((row.actions ?? []).find((a: any) => a.action_type === "lead")?.value ?? 0),
+      }));
+    });
+    return reply.send({ status: 1, data, from_cache, stale: stale ?? false });
+  } catch (err: any) {
+    return reply.send({ status: 1, data: [], error: err?.message ?? "Failed to fetch timeseries" });
   }
 };
 
@@ -2441,24 +2518,24 @@ export const getInsightsByCampaign = async (req: FastifyRequest, reply: FastifyR
   if (!acct?.ad_account_id) return reply.send({ status: 1, data: [] });
 
   try {
-    const res = await fetch(
-      `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=campaign_id,campaign_name,spend,impressions,clicks,actions&level=campaign&${insightsTimeParam(req.query)}&limit=200&access_token=${acct.access_token}`
-    );
-    const json: any = await res.json();
-    if (json.error) return reply.send({ status: 1, data: [], error: json.error.message });
-
-    const data = (json.data ?? []).map((row: any) => ({
-      id:          row.campaign_id,
-      name:        row.campaign_name,
-      spend:       Number(row.spend ?? 0),
-      impressions: Number(row.impressions ?? 0),
-      clicks:      Number(row.clicks ?? 0),
-      leads:       Number((row.actions ?? []).find((a: any) => a.action_type === "lead")?.value ?? 0),
-    }));
-
-    return reply.send({ status: 1, data });
-  } catch {
-    return reply.send({ status: 1, data: [], error: "Failed to fetch campaign insights" });
+    const { data, from_cache, stale } = await withInsightsCache(acct, `bycampaign:${insightsRangeKey(req.query)}`, async () => {
+      const res = await fetch(
+        `${META_GRAPH_BASE}/act_${acct.ad_account_id}/insights?fields=campaign_id,campaign_name,spend,impressions,clicks,actions&level=campaign&${insightsTimeParam(req.query)}&limit=200&access_token=${acct.access_token}`
+      );
+      const json: any = await res.json();
+      if (json.error) throw new Error(json.error.message);
+      return (json.data ?? []).map((row: any) => ({
+        id:          row.campaign_id,
+        name:        row.campaign_name,
+        spend:       Number(row.spend ?? 0),
+        impressions: Number(row.impressions ?? 0),
+        clicks:      Number(row.clicks ?? 0),
+        leads:       Number((row.actions ?? []).find((a: any) => a.action_type === "lead")?.value ?? 0),
+      }));
+    });
+    return reply.send({ status: 1, data, from_cache, stale: stale ?? false });
+  } catch (err: any) {
+    return reply.send({ status: 1, data: [], error: err?.message ?? "Failed to fetch campaign insights" });
   }
 };
 
